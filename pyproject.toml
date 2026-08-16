@@ -1,0 +1,25 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "bbl"
+version = "0.1.0"
+description = "Agentic plasmid design from a library-plasmid inventory (reAGENT hackathon)"
+requires-python = ">=3.10"
+dependencies = [
+    "biopython>=1.83",
+    # pydivsufsort must be pinned: 0.0.19/0.0.20 are sdist-only and their build.sh
+    # fails on this cluster. 0.0.18 ships a cp312 manylinux wheel. See docs/DECISIONS.md D3.
+    "pydivsufsort==0.0.18",
+    "pydna>=5.5",
+]
+
+[project.optional-dependencies]
+test = ["pytest>=7"]
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
