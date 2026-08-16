@@ -47,7 +47,7 @@ from .plasmid_io import (
     replace_span,
     slice_circular,
 )
-from .targets import classify_features, resolve_target
+from .targets import classify_features, handle_warnings, resolve_target
 
 RESTRICTION = "restriction"
 GIBSON_PCR = "gibson_pcr"
@@ -252,6 +252,35 @@ def _flanking(cuts, boundary, side, limit=_MAX_FLANK_CANDIDATES):
         chosen = [c for c in cuts if c.top >= boundary]
         chosen.sort(key=lambda c: c.top)
     return chosen[:limit]
+
+
+def _verify_product(vector, product, protected, expected_length, wanted_sequence):
+    """Return a list of failures; empty means the assembled product is sound.
+
+    Mirrors :func:`bbl.excise._verify`. Insertion previously checked length, insert presence,
+    homology-arm uniqueness and site regeneration -- but never re-checked that the features the
+    caller asked to protect actually survived. ``protected`` steered the choice of cut sites and
+    was then dropped, so a route that destroyed a protected feature by some path other than
+    cutting inside it would have been returned without complaint. Insertion is the more
+    error-prone of the two operations, so it should not verify to a weaker standard than
+    excision.
+
+    Searches the **doubled** product so a feature spanning the origin still reads as intact.
+    """
+    failures = []
+    if len(product) != expected_length:
+        failures.append(f"length {len(product)} != expected {expected_length}")
+
+    doubled = (str(product.seq) * 2).upper()
+    if wanted_sequence and wanted_sequence.upper() not in doubled:
+        failures.append("the sequence of interest is missing from the product")
+
+    for start, end, label in protected:
+        start, end = max(0, start), min(len(vector), end)
+        original = str(vector.seq[start:end]).upper()
+        if original and original not in doubled:
+            failures.append(f"protected feature {label!r} is not intact in the product")
+    return failures
 
 
 def _junctions(vector_text, left_cut, right_cut, insert_sequence):
@@ -491,11 +520,16 @@ def plan_insertion(
                 features=features_in_span(source.donor, up_d.top, down_d.top),
                 truncation_note="truncated by insertion",
             )
-            expected = len(vector) - (down_v.top - up_v.top) + len(fragment)
-            if len(product) != expected:
-                raise NoInsertionRoute(f"length check failed: {len(product)} != {expected}")
-            if source.sequence not in str(product.seq).upper():
-                raise NoInsertionRoute("the sequence of interest is missing from the product")
+            failures = _verify_product(
+                vector,
+                product,
+                protected,
+                len(vector) - (down_v.top - up_v.top) + len(fragment),
+                source.sequence,
+            )
+            if failures:
+                raise NoInsertionRoute("; ".join(failures))
+            warnings.extend(handle_warnings(vector, product))
 
             enzymes_used = {up_v.enzyme, down_v.enzyme, up_d.enzyme, down_d.enzyme}
             regenerated = any(e.search(product.seq, linear=False) for e in enzymes_used)
@@ -668,11 +702,16 @@ def plan_insertion(
         features=source.features,
         truncation_note="truncated by insertion",
     )
-    expected = len(vector) - (open_end - open_start) + source.length
-    if len(product) != expected:
-        raise NoInsertionRoute(f"length check failed: {len(product)} != {expected}")
-    if source.sequence not in str(product.seq).upper():
-        raise NoInsertionRoute("the sequence of interest is missing from the product")
+    failures = _verify_product(
+        vector,
+        product,
+        protected,
+        len(vector) - (open_end - open_start) + source.length,
+        source.sequence,
+    )
+    if failures:
+        raise NoInsertionRoute("; ".join(failures))
+    warnings.extend(handle_warnings(vector, product))
 
     product_text = str(product.seq).upper()
     for label, arm in (("upstream", arm_up), ("downstream", arm_down)):

@@ -28,7 +28,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 
-from .complexity import ComplexityReport, complexity_score
+from .complexity import REJECT_SCORE, ComplexityReport, complexity_score
 from .config import is_available, is_base_vector, load_lab_config
 from .inventory import Provenance, find_sequence
 
@@ -164,10 +164,11 @@ def source_insert(
             "optional: splitting into two shorter fragments and doing a 3-fragment Gibson "
             "sometimes passes where one long fragment does not"
         )
-    if report.is_placeholder:
-        rationale.append(
-            "NOTE: complexity screening is a placeholder -- confirm with the vendor's own tool"
-        )
+    rationale.append(
+        f"NOTE: the screen is heuristic (score {report.raw_score:.1f} against a "
+        f"{REJECT_SCORE:.0f} reject threshold, {report.verdict}) and its weights are anchored "
+        "to a single observed rejection -- confirm with the vendor's own tool before ordering"
+    )
     return SourcingDecision(
         route=ORDER_PLASMID,
         name=name,

@@ -23,12 +23,38 @@ from Bio.SeqUtils import MeltingTemp as mt
 from Bio.SeqUtils import gc_fraction
 
 from .plasmid_io import delete_span, load_plasmid, slice_circular
-from .targets import classify_features, essential_warnings, resolve_target
+from .seqfeatures import max_hairpin_stem, max_homopolymer, revcomp, three_prime_hairpin
+from .targets import (
+    classify_features,
+    essential_warnings,
+    handle_warnings,
+    resolve_target,
+)
 
 KLD = "KLD"
 GIBSON = "gibson"
 
 _UNIQUENESS_PROBE = 15
+
+# Penalty weights, in units of roughly one degree of Tm: |dTm| dominates the objective and the
+# pre-existing terms are 2-3, so these are calibrated against that scale.
+#
+# Mispriming is deliberately the largest. A primer with a second binding site amplifies the
+# wrong thing, and no amount of Tm matching rescues that -- whereas a mediocre Tm just costs
+# yield. Until now this was measured and then ignored (see _annotate).
+_MISPRIME_WEIGHT = 6.0
+#: Stems up to this length are ordinary in a 20-30mer and cost nothing.
+_HAIRPIN_FREE_STEM = 8
+_HAIRPIN_WEIGHT = 1.0
+#: A hairpin that occludes the 3' end blocks extension outright, so it is charged separately
+#: and harder than the same stem sitting further upstream.
+_THREE_PRIME_FREE_STEM = 3
+_THREE_PRIME_WEIGHT = 4.0
+#: Cross-complementarity between the two primers' 3' ends -- the classic primer-dimer.
+_HETERODIMER_FREE_STEM = 3
+_HETERODIMER_WEIGHT = 1.5
+#: Short seed, because a 20-30mer is too short for the 6-mer default to find real stems.
+_OLIGO_SEED = 4
 
 
 class NoPrimerDesign(RuntimeError):
@@ -138,29 +164,42 @@ class DeletionPCR:
 # emitted design says so.
 
 
-def _longest_homopolymer(sequence: str) -> int:
-    best = run = 1
-    for previous, current in zip(sequence, sequence[1:]):
-        run = run + 1 if current == previous else 1
-        best = max(best, run)
-    return best
+def _hairpin_stem(sequence: str) -> int:
+    """Longest hairpin stem anywhere in the oligo.
+
+    Replaces an earlier ``_self_complementarity`` that searched for self-reverse-complementary
+    substrings with no loop constraint, and so could not tell a fold-back that actually forms
+    from an inverted repeat whose arms cannot reach each other.
+    """
+    stem, _ = max_hairpin_stem(sequence, seed=_OLIGO_SEED)
+    return stem
 
 
-def _self_complementarity(sequence: str, window: int = 5) -> int:
-    """Longest stretch of the primer that is reverse-complementary to elsewhere in itself."""
-    rc = str(Seq(sequence).reverse_complement())
-    best = 0
-    for size in range(window, min(len(sequence), 12) + 1):
-        for start in range(len(sequence) - size + 1):
-            if sequence[start : start + size] in rc:
-                best = max(best, size)
-    return best
+def _three_prime_stem(sequence: str) -> int:
+    """Length of the hairpin stem closing on the oligo's 3' terminal base, 0 if none."""
+    stem, _ = three_prime_hairpin(sequence)
+    return stem
 
 
-def _three_prime_self_dimer(sequence: str, window: int = 5) -> bool:
-    """True if the 3' end can fold back onto the primer -- the worst kind of dimer."""
-    tail = sequence[-window:]
-    return str(Seq(tail).reverse_complement()) in sequence[:-window]
+def _heterodimer_stem(first: str, second: str) -> int:
+    """Longest 3'-anchored cross-complementarity between two oligos.
+
+    The measurement `bbl` was missing: :func:`_select_pair` chooses a *pair*, but its only
+    cross-term was dTm, so nothing stopped it picking two primers whose 3' ends anneal to each
+    other in preference to the template.
+
+    Directional -- it asks whether ``first``'s 3' end pairs into ``second`` -- so callers check
+    both orders.
+    """
+    first, second = first.upper(), second.upper()
+    for length in range(min(len(first), len(second)), 0, -1):
+        if revcomp(first[-length:]) in second:
+            return length
+    return 0
+
+
+def _pair_heterodimer_stem(first: str, second: str) -> int:
+    return max(_heterodimer_stem(first, second), _heterodimer_stem(second, first))
 
 
 def _binding_sites(template: str, probe: str) -> int:
@@ -176,7 +215,28 @@ def _binding_sites(template: str, probe: str) -> int:
     return extended.count(probe) + extended.count(reverse)
 
 
-def _penalty(sequence: str, tm: float, target_tm: float, min_gc: float, max_gc: float) -> float:
+def _mispriming_sites(template: str, sequence: str) -> int:
+    """Occurrences of the oligo's 3' probe in the plasmid. 1 is the wanted site."""
+    probe = (
+        sequence[-_UNIQUENESS_PROBE:] if len(sequence) >= _UNIQUENESS_PROBE else sequence
+    )
+    return _binding_sites(template, probe)
+
+
+def _penalty(
+    sequence: str,
+    tm: float,
+    target_tm: float,
+    min_gc: float,
+    max_gc: float,
+    template: str | None = None,
+) -> float:
+    """Rank one oligo. Lower is better; the scale is roughly degrees of Tm.
+
+    ``template`` is optional only so the function stays callable on a bare oligo; when it is
+    supplied -- which is always, in the design path -- specificity is part of the ranking rather
+    than a note attached after the choice has already been made.
+    """
     score = abs(tm - target_tm)
     gc = gc_fraction(sequence) * 100
     if gc < min_gc:
@@ -187,11 +247,14 @@ def _penalty(sequence: str, tm: float, target_tm: float, min_gc: float, max_gc: 
         score += 2.0  # a G/C clamp stabilises the 3' end
     if sum(base in "GC" for base in sequence[-5:].upper()) > 3:
         score += 2.0  # too G/C-rich a 3' end promotes mispriming
-    if _longest_homopolymer(sequence) >= 4:
+    if max_homopolymer(sequence) >= 4:
         score += 2.0
-    score += 1.0 * max(0, _self_complementarity(sequence) - 5)
-    if _three_prime_self_dimer(sequence):
-        score += 3.0
+    score += _HAIRPIN_WEIGHT * max(0, _hairpin_stem(sequence) - _HAIRPIN_FREE_STEM)
+    score += _THREE_PRIME_WEIGHT * max(
+        0, _three_prime_stem(sequence) - _THREE_PRIME_FREE_STEM
+    )
+    if template is not None:
+        score += _MISPRIME_WEIGHT * max(0, _mispriming_sites(template, sequence) - 1)
     return score
 
 
@@ -214,7 +277,9 @@ def _candidates(template, boundary, strand, min_length, max_length, target_tm, m
                 "span": span,
                 "tm": tm,
                 "gc": gc_fraction(sequence) * 100,
-                "penalty": _penalty(sequence, tm, target_tm, min_gc, max_gc),
+                "penalty": _penalty(
+                    sequence, tm, target_tm, min_gc, max_gc, template=template
+                ),
             }
         )
     return options
@@ -224,19 +289,32 @@ def _select_pair(
     template, forward_boundary, reverse_boundary, min_length, max_length,
     target_tm, min_gc, max_gc,
 ):
-    """Best (forward, reverse) length combination, balancing per-primer quality and dTm."""
+    """Best (forward, reverse) length combination, balancing per-primer quality, dTm and dimers.
+
+    The heterodimer term is scored on the *annealing* sequences, which is what ``_candidates``
+    produces -- 5' tails are attached afterwards in :func:`_annotate`. That distinction matters:
+    in a Gibson design the two tails are complementary to the template on either side of the
+    junction by construction, so scoring the full ordered oligo would flag every correct
+    assembly primer as a dimer.
+    """
     forward = _candidates(
         template, forward_boundary, +1, min_length, max_length, target_tm, min_gc, max_gc
     )
     reverse = _candidates(
         template, reverse_boundary, -1, min_length, max_length, target_tm, min_gc, max_gc
     )
+
+    def objective(f, r):
+        cross = _pair_heterodimer_stem(f["sequence"], r["sequence"])
+        return (
+            f["penalty"]
+            + r["penalty"]
+            + 2.0 * abs(f["tm"] - r["tm"])
+            + _HETERODIMER_WEIGHT * max(0, cross - _HETERODIMER_FREE_STEM)
+        )
+
     _, best_forward, best_reverse = min(
-        (
-            (f["penalty"] + r["penalty"] + 2.0 * abs(f["tm"] - r["tm"]), f, r)
-            for f in forward
-            for r in reverse
-        ),
+        ((objective(f, r), f, r) for f in forward for r in reverse),
         key=lambda triple: triple[0],
     )
     return best_forward, best_reverse
@@ -263,18 +341,26 @@ def design_inward_pair(template, span, **kwargs):
 def _annotate(option, template, name, strand, tail, phosphorylated) -> Primer:
     sequence = option["sequence"]
     notes = []
-    probe = sequence[-_UNIQUENESS_PROBE:] if len(sequence) >= _UNIQUENESS_PROBE else sequence
-    sites = _binding_sites(template, probe)
+    # Every note here calls the same function the penalty does, so a note and the ranking can
+    # never disagree about the same oligo.
+    probe_length = min(len(sequence), _UNIQUENESS_PROBE)
+    sites = _mispriming_sites(template, sequence)
     if sites > 1:
         notes.append(
-            f"3' {len(probe)}-mer occurs {sites}x in the plasmid -- risk of mispriming"
+            f"3' {probe_length}-mer occurs {sites}x in the plasmid -- risk of mispriming"
         )
     if sequence[-1] not in "GC":
         notes.append("no G/C clamp at the 3' end")
-    if _longest_homopolymer(sequence) >= 4:
-        notes.append(f"homopolymer run of {_longest_homopolymer(sequence)}")
-    if _three_prime_self_dimer(sequence):
-        notes.append("3' end is self-complementary -- check for primer-dimer")
+    if max_homopolymer(sequence) >= 4:
+        notes.append(f"homopolymer run of {max_homopolymer(sequence)}")
+    three_prime = _three_prime_stem(sequence)
+    if three_prime > _THREE_PRIME_FREE_STEM:
+        notes.append(
+            f"{three_prime} bp hairpin closes on the 3' end -- extension may be blocked"
+        )
+    hairpin = _hairpin_stem(sequence)
+    if hairpin > _HAIRPIN_FREE_STEM:
+        notes.append(f"{hairpin} bp internal hairpin stem")
     return Primer(
         name=name,
         sequence=tail + sequence,
@@ -398,8 +484,18 @@ def design_deletion_primers(
             f"primer Tms differ by {abs(forward.tm - reverse.tm):.1f} C; consider a "
             "touchdown or gradient anneal"
         )
+    # A pair property, so it belongs here rather than on either primer. Scored on the annealing
+    # regions: a Gibson design's tails are template-complementary by construction and would
+    # otherwise read as a dimer.
+    heterodimer = _pair_heterodimer_stem(forward.anneal, reverse.anneal)
+    if heterodimer > _HETERODIMER_FREE_STEM:
+        warnings.append(
+            f"the primers' 3' ends are complementary over {heterodimer} bp -- primer-dimer "
+            "risk; the pair was still the best available"
+        )
 
     product = delete_span(record, target_start, target_end)
+    warnings.extend(handle_warnings(record, product))
     amplicon_bp = len(record) - deleted_bp + len(forward_tail) + len(reverse_tail)
     if amplicon_bp > 6000:
         warnings.append(

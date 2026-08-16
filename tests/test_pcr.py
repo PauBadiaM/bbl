@@ -18,7 +18,13 @@ from bbl import (
     excise_features,
     load_plasmid,
 )
-from bbl.pcr import _binding_sites
+from bbl.pcr import (
+    _binding_sites,
+    _candidates,
+    _mispriming_sites,
+    _pair_heterodimer_stem,
+    _penalty,
+)
 from bbl.plasmid_io import feature_label
 
 NFKBRE_START, NFKBRE_END = 160, 214
@@ -212,6 +218,76 @@ def test_mispriming_in_a_repeat_is_flagged(phl391):
 # --------------------------------------------------------------------------- #
 # helpers and error paths
 # --------------------------------------------------------------------------- #
+
+
+def test_specificity_changes_which_primer_is_chosen(phl391):
+    """The point of the whole exercise: mispriming now *ranks*, it does not just annotate.
+
+    ``_binding_sites`` used to run only in ``_annotate``, after ``_select_pair`` had already
+    committed -- so a primer whose 3' probe occurs 8x in the plasmid could be returned as the
+    best available with a note attached. Inside the 8x BoxB array at a 56 C target, that is
+    exactly what the old objective did.
+    """
+    record = load_plasmid(phl391)
+    template = str(record.seq).upper()
+    boxb = [
+        (int(f.location.start), int(f.location.end))
+        for f in record.features
+        if feature_label(f) == "BoxB RNA aptamer"
+    ]
+    options = _candidates(template, boxb[3][1], +1, 18, 32, 56.0, 35.0, 65.0)
+
+    def specificity_blind(option):
+        return _penalty(option["sequence"], option["tm"], 56.0, 35.0, 65.0, template=None)
+
+    chosen = min(options, key=lambda option: option["penalty"])
+    would_have_chosen = min(options, key=specificity_blind)
+
+    blind_sites = _mispriming_sites(template, would_have_chosen["sequence"])
+    chosen_sites = _mispriming_sites(template, chosen["sequence"])
+    assert blind_sites == 8
+    assert chosen_sites == 2
+    assert chosen["sequence"] != would_have_chosen["sequence"]
+
+
+def test_an_unavoidable_mispriming_is_still_reported(phl391):
+    """Ranking must not silence a warning it cannot act on.
+
+    Every candidate at a BoxB boundary sits inside the array, so no length escapes mispriming.
+    The penalty picks the least bad one and the warning still fires.
+    """
+    record = load_plasmid(phl391)
+    template = str(record.seq).upper()
+    boxb = [
+        (int(f.location.start), int(f.location.end))
+        for f in record.features
+        if feature_label(f) == "BoxB RNA aptamer"
+    ]
+    options = _candidates(template, boxb[3][1], +1, 18, 32, 60.0, 35.0, 65.0)
+    assert all(_mispriming_sites(template, o["sequence"]) > 1 for o in options)
+
+    design = design_deletion_primers(record, [boxb[3]], warn_if_restriction_possible=False)
+    assert any("mispriming" in warning for warning in design.warnings)
+
+
+def test_heterodimers_are_scored_on_the_annealing_region_only(no_sites_phl391):
+    """A Gibson design's 5' tails are template-complementary by construction.
+
+    Scoring the ordered oligo would flag every correct assembly primer as a dimer, so the pair
+    term must see ``anneal``, not ``tail + anneal``. The KLD and Gibson designs share their
+    annealing regions, so their heterodimer measurement must be identical.
+    """
+    kld = design_deletion_primers(no_sites_phl391, ["NFKBRE"], method=KLD)
+    gibson = design_deletion_primers(no_sites_phl391, ["NFKBRE"], method=GIBSON, overlap=20)
+
+    assert gibson.forward.tail and gibson.reverse.tail  # precondition: tails exist
+    assert kld.forward.anneal == gibson.forward.anneal
+
+    on_anneal = _pair_heterodimer_stem(gibson.forward.anneal, gibson.reverse.anneal)
+    on_ordered = _pair_heterodimer_stem(gibson.forward.sequence, gibson.reverse.sequence)
+    assert on_anneal == _pair_heterodimer_stem(kld.forward.anneal, kld.reverse.anneal)
+    # the tails inflate the apparent dimer, which is why they are excluded
+    assert on_ordered >= on_anneal
 
 
 def test_binding_sites_does_not_double_count(no_sites_phl391):

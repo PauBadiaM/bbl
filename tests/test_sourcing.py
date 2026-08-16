@@ -3,7 +3,18 @@
 import pytest
 from Bio.Seq import Seq
 
-from bbl.complexity import complexity_score, longest_homopolymer, longest_repeat, repeat_fraction
+from bbl.complexity import (
+    _REPEAT_BASE,
+    _REPEAT_MAX,
+    _REPEAT_SLOPE,
+    REJECT_SCORE,
+    _ramp,
+    complexity_score,
+    feature_vector,
+    longest_homopolymer,
+    longest_repeat,
+    repeat_fraction,
+)
 from bbl.config import DEFAULTS, is_available, is_base_vector, load_lab_config
 from bbl.inventory import find_sequence, scan_inventory
 from bbl.sourcing import (
@@ -60,7 +71,10 @@ def test_ordinary_fragment_passes():
     report = complexity_score(plain_sequence(600))
     assert report.synthesizable
     assert not report.reasons
-    assert report.is_placeholder  # loudly flagged until the real function lands
+    assert not report.is_placeholder  # the real, IDT-anchored screen is installed
+    assert report.verdict == "LIKELY ACCEPT"
+    assert report.raw_score == 0.0
+    assert not report.contributions
 
 
 def test_boxb_array_is_refused(boxb):
@@ -81,6 +95,84 @@ def test_limits_are_overridable():
     sequence = plain_sequence(600)
     assert complexity_score(sequence).synthesizable
     assert not complexity_score(sequence, limits={"max_length": 100}).synthesizable
+
+
+def test_the_idt_anchors_reproduce():
+    """The weights are only meaningful if they reproduce the sub-scores they were fit to.
+
+    Anchors observed on a real IDT rejection. The 19 bp figure is the one the source module
+    documented but did not implement -- it scored 8 there.
+    """
+    assert _ramp(87, 20, _REPEAT_BASE, _REPEAT_SLOPE, _REPEAT_MAX) == pytest.approx(48.3, abs=0.2)
+    assert _REPEAT_BASE == pytest.approx(10.0)
+    assert _ramp(0.939, 0.58, 0.0, 40.0, 20.0) == pytest.approx(14.4, abs=0.1)
+    assert _ramp(0.88, 0.70, 8.0, 77.8, 22.0) == pytest.approx(21.6, abs=0.5)
+
+
+def test_the_score_is_graded_not_a_step():
+    """What the placeholder could not do: rank two bad fragments against each other.
+
+    The placeholder saturated at 1.0, so a 12 bp homopolymer and a 40 bp one were the same
+    answer and neither could be preferred.
+    """
+    filler = plain_sequence(600)
+    mild = complexity_score(filler[:300] + "A" * 11 + filler[300:])
+    severe = complexity_score(filler[:300] + "A" * 25 + filler[300:])
+    assert 0 < mild.raw_score < severe.raw_score
+
+
+def test_a_single_moderate_breach_no_longer_condemns_a_fragment():
+    """The deliberate behaviour change from adopting calibrated bands.
+
+    The placeholder refused on *any* breach (``synthesizable = not reasons``). A 10-point
+    feature is now BORDERLINE and still orderable; only the 24-point threshold refuses. This
+    moves the buy-vs-synthesize boundary in ``source_insert``, so it is pinned here.
+    """
+    filler = plain_sequence(600)
+    borderline = complexity_score(filler[:300] + "A" * 14 + filler[300:])
+    assert 0 < borderline.raw_score < REJECT_SCORE
+    assert borderline.verdict == "BORDERLINE (check vendor)"
+    assert borderline.synthesizable
+
+
+def test_length_is_a_hard_gate_regardless_of_the_band():
+    """A fragment can be trivially simple and still not orderable.
+
+    ``gblock_complexity`` had no length rule at all, so without this the swap would have lost
+    the vendor bounds the placeholder enforced.
+    """
+    short = complexity_score(plain_sequence(60))
+    assert short.raw_score < REJECT_SCORE  # nothing complex about it
+    assert short.verdict == "LIKELY ACCEPT"
+    assert not short.synthesizable  # ...but still not orderable
+    assert any("minimum" in reason for reason in short.reasons)
+
+
+def test_positional_gc_is_visible_to_the_screen():
+    """A fragment at acceptable global GC with an extreme local window.
+
+    Every GC measure in the codebase was global before this, so this fragment was invisible.
+    """
+    report = complexity_score("GC" * 150 + "AT" * 150)
+    assert 25.0 <= report.metrics["gc_percent"] <= 75.0  # global GC is unremarkable
+    assert report.metrics["gc_window_max"] > 0.85  # the local window is not
+    assert any(name == "gc_window_high" for name, _, _ in report.contributions)
+
+
+def test_contributions_name_the_features_that_drive_risk(boxb):
+    report = complexity_score(boxb)
+    assert not report.synthesizable
+    assert report.verdict == "LIKELY REJECT"
+    names = {name for name, _, _ in report.contributions}
+    assert "repeat_long" in names
+    assert all(penalty > 0 for _, penalty, _ in report.contributions)
+
+
+def test_feature_vector_is_all_numeric():
+    vector = feature_vector(plain_sequence(600))
+    assert vector
+    assert all(isinstance(value, (int, float)) for value in vector.values())
+    assert "longest_repeat_sequence" not in vector
 
 
 # --------------------------------------------------------------------------- #

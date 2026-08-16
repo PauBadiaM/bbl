@@ -11,6 +11,50 @@ from .plasmid_io import NON_FUNCTIONAL_TYPES, feature_label, feature_span
 #: Labels that look like an origin or a selection marker; deleting one is flagged.
 ESSENTIAL_HINTS = ("ori", "ampr", "neor", "kanr", "puro", "blast", "bsd", "hygro")
 
+#: Sequencing/amplification handles whose survival is the whole point of the construct: lose
+#: one and the plasmid still propagates, still sequences clean, and is silently unreadable.
+#:
+#: Checked by plain substring survival. That is deliberately the crude test -- it is also the
+#: *correct* one. A PWM scan (Proto's ``seq-motif``, via FIMO) answers "is there something
+#: motif-like here", which is not the question; the question is whether this exact handle is
+#: still present for the readout primer to bind.
+#: Hints are matched against the *annotated* label, not the plasmid filename. The two differ:
+#: ``pHL394``'s name says ``10XCS1`` but its feature is labelled ``10X Capture Sequence 1``, so
+#: a ``"10xcs1"`` hint silently matches nothing. ``"ofh"`` is the lab's own oligo namespace and
+#: deliberately broad -- every ``oFHnnn`` feature is a primer-binding site someone depends on,
+#: and a warning only fires when one is actually destroyed.
+READOUT_HANDLE_HINTS = (
+    "ofh",
+    "truseq",
+    "10x capture",
+    "capture sequence",
+    "amplicon pcr",
+    "amplicon rt",
+)
+
+
+def handle_warnings(parent, product) -> list[str]:
+    """Warn for any annotated readout handle in ``parent`` that is not intact in ``product``.
+
+    Fires without the caller having to remember to pass ``protect``, which is the point: these
+    handles are easy to lose and their loss is invisible until sequencing comes back unreadable.
+    Searches the doubled product so an origin-spanning handle still reads as intact.
+    """
+    doubled = (str(product.seq) * 2).upper()
+    warnings = []
+    for feature in parent.features:
+        label = feature_label(feature)
+        if not label or not any(hint in label.lower() for hint in READOUT_HANDLE_HINTS):
+            continue
+        start, end = feature_span(feature)
+        handle = str(parent.seq[start:end]).upper()
+        if handle and handle not in doubled:
+            warnings.append(
+                f"readout handle {label!r} is not intact in the product -- the construct may "
+                "no longer be amplifiable or sequenceable at that end"
+            )
+    return warnings
+
 
 def tight_arc(intervals: list[tuple[int, int]], length: int) -> tuple[int, int]:
     """Smallest circular arc covering every interval.

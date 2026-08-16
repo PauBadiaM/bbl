@@ -962,3 +962,125 @@ broken.
 Prose questions still work and are still preferred. The split the system prompt now draws:
 anything you can carry to the end of your message goes there, answered at the `›` prompt;
 anything that has to be answered *before* the next tool call goes through `ask_user`.
+
+---
+
+# Ninth milestone: QC metrics that actually gate something (`seqfeatures.py`, `complexity.py`)
+
+# D85. The test for a QC metric is whether anything branches on it
+
+An audit of every quality measurement in `bbl` turned up one that was computed and then
+ignored. `_binding_sites` measures how many times a primer's 3' probe occurs in the plasmid --
+the mispriming risk -- but it ran only inside `_annotate`, which executes *after* `_select_pair`
+has already committed to a pair. `_penalty` did not even take `template`. The designer could
+pick a primer whose 3' 15-mer occurs eight times, attach the note "risk of mispriming", and
+return it as the best available design.
+
+That is worse than not measuring it. A number that appears in the output implies something
+considered it.
+
+So the rule this milestone applies: **a metric that neither gates nor ranks anything is dead
+weight, and gets wired up or left out.** Applied consistently, it also settles what *not* to
+add -- see D87.
+
+Concretely, mispriming now enters `_penalty`, and `_select_pair`'s objective gains the
+cross-term it was missing. Verified to change a real decision, not just a number: deleting one
+repeat of the 8x BoxB array at a 56 C target, the old objective chose a 20-mer whose probe binds
+**8** times; the new one chooses a 28-mer that binds twice. Regression:
+`test_specificity_changes_which_primer_is_chosen`.
+
+The converse case is pinned too. Inside that array *every* candidate mis-primes, so no length
+escapes -- ranking must not be allowed to silence a warning it cannot act on
+(`test_an_unavoidable_mispriming_is_still_reported`).
+
+# D86. Three measurements were missing, and each one hid a specific failure
+
+**Primer-primer heterodimer.** `_select_pair` chooses a *pair*, but its only cross-term was
+dTm; only *self*-dimer was measured. Forward/reverse 3' complementarity is the classic
+primer-dimer and nothing was looking at it. Scored on `anneal`, never on `tail + anneal`: a
+Gibson design's 5' tails are template-complementary *by construction*, so scoring the ordered
+oligo would flag every correct assembly primer.
+
+**Hairpins with a loop constraint.** The old `_self_complementarity` found self-reverse-
+complementary substrings anywhere in the oligo with no loop bound and no stability, so it could
+not distinguish a fold-back that blocks the 3' end from an inverted repeat whose arms cannot
+reach each other. `three_prime_hairpin` and `max_hairpin_stem` are separate measurements
+because the two cost differently and are weighted differently.
+
+**Positional GC.** Every GC number in the codebase was global. A fragment at 50% global GC can
+hide a 90% GC 50-mer, and high 5' GC is worth 10 points on a real IDT rejection.
+
+# D87. The Proto bake-off recommendation is reinforced, not revised
+
+`QC_BAKEOFF.md` argued that Proto's single clear advantage was **graded penalties instead of
+step functions** -- native saturating at 1.0 where Proto log-scales, which is real signal when
+*ranking* candidates rather than merely accepting them.
+
+The lab's own screener already grades: `min(50.0, 10 + (repeat_bp - 20) * 0.57)`, continuous and
+monotone, in units anchored to observed vendor sub-scores rather than a dimensionless [0, 1].
+The headline argument for the dependency is therefore gone, and the packaging cost
+(glibc 2.17 vs `manylinux_2_28`; `proto_language.constraint.__init__` importing eagerly, so a
+GC function drags in biotite and rdkit) is unchanged.
+
+`dinucleotide_composition` and `kmer_frequency` -- the two genuinely Proto-only checks -- stay
+**unadopted, deliberately**. Nothing in the codebase would consume them. By D85 they would be
+inert on arrival, exactly as `_binding_sites` was. They remain in `bbl.qc` as bake-off evidence.
+The bake-off suite still runs green and unchanged (18 passed, 19 skipped) after the swap, which
+is the check that the evidence was not quietly invalidated by the thing it justified.
+
+# D88. Replacing the complexity placeholder moves a decision boundary, on purpose
+
+`complexity.py` was a self-declared placeholder that nonetheless gated buy-vs-synthesize at
+`source_insert`. It is now the lab's IDT-anchored screener, over shared primitives in
+`seqfeatures.py`.
+
+The behavioural change worth stating plainly: the placeholder refused on **any** threshold
+breach (`synthesizable = not reasons`). Calibrated bands mean a single 10-point feature is now
+BORDERLINE and still orderable; only the 24-point threshold refuses. That is the point of
+adopting bands, but it moves which fragments get bought versus synthesized, so it is pinned by
+`test_a_single_moderate_breach_no_longer_condemns_a_fragment` rather than left to be discovered.
+
+Three departures from a naive port of the screener, each a defect in the original:
+
+* **Non-ACGT is no longer silently stripped.** `"".join(c for c in seq if c in "ACGT")` shortens
+  the sequence and shifts GC and every density denominator -- the same silent-wrong-answer class
+  as `enumerate_cut_sites` reporting zero cut sites when handed a plain `str` (found while
+  building the bake-off).
+* **`repeat_mask` is Bonferroni-corrected.** Honest about the size of this: it is a correctness
+  fix to the *claim* of significance, not much of a behavioural one. The rules consuming the
+  mask only fire above 58% coverage, where significance is overwhelming either way. It makes the
+  mask conservative; genuine long repeats are caught by `longest_repeat` independently.
+* **The documented "~19 bp repeat -> 10" anchor is honoured.** The source scored 8 there. The
+  other three anchors reproduced to within 0.5.
+
+**Length stayed a hard gate.** The screener has no length rule at all, so a straight swap would
+have lost the 125/3000 bp vendor bounds the placeholder enforced. A 60 bp fragment is
+`LIKELY ACCEPT` on complexity and still not orderable; the gate overrides the band.
+
+**`longest_repeat` now searches to `n - 1`, not `n // 2`.** Occurrences overlap -- `AAAA`
+contains `AAA` twice -- so the old ceiling undercounted precisely the tandem array the
+measurement exists to catch.
+
+# D89. Insertion verified to a weaker standard than excision
+
+`excise._verify` re-checks that every protected feature survives the product. `plan_insertion`
+checked length, insert presence, homology-arm uniqueness and site regeneration -- but used
+`protected` only to steer the choice of cut sites, then dropped it. Nothing re-checked that the
+protected features were still there. Insertion is the more error-prone of the two operations, so
+it should not verify to a weaker standard. `_verify_product` now mirrors `excise._verify` and
+runs on both the restriction and Gibson paths.
+
+Separately, **readout handles are checked without being asked**. Losing an `oFH155` /
+`TruseqR2` / `10X Capture Sequence 1` handle is invisible: the plasmid still propagates and
+still sequences clean, it is just no longer readable at that end. `protect` catches this only if
+the caller remembers to name the handle, so `handle_warnings` runs unprompted on every product.
+
+Plain substring survival, deliberately -- and it is also the *correct* test. `QC_BAKEOFF.md`
+established that Proto's `seq-motif` is PWM scanning via FIMO, which answers "is there something
+motif-like here"; the question is whether this exact handle is still present for a primer to
+bind.
+
+The registry matches **annotated labels, not filenames**, which the first version got wrong:
+`pHL394`'s filename says `10XCS1` while its feature is labelled `10X Capture Sequence 1`, so the
+obvious hint matched nothing at all -- a registry that looks populated and detects nothing.
+Pinned by `test_the_hint_list_matches_annotated_labels_not_filenames`.

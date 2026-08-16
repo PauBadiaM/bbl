@@ -25,7 +25,7 @@ from .enzymes import (
     ligation_strategy,
 )
 from .plasmid_io import circular_equal, delete_span, load_plasmid, slice_circular
-from .targets import classify_features, essential_warnings, resolve_target
+from .targets import classify_features, essential_warnings, handle_warnings, resolve_target
 
 _JUNCTION_CONTEXT = 6
 
@@ -344,6 +344,7 @@ def plan_excisions(
         ).upper()
 
         warnings = list(base_warnings)
+        warnings.extend(handle_warnings(record, product))
         if strategy == BLUNT:
             warnings.append("blunt ligation is inefficient and non-directional")
         if regenerated and strategy != SAME_ENZYME:

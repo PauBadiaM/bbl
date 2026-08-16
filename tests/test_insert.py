@@ -309,3 +309,43 @@ def test_only_two_insertion_chemistries_remain(phl391, phl162):
             phl391, phl162, insert_features=[CMV_SPAN], at=PCLM2_SITE,
             method="pcr_restriction",
         )
+
+
+# --------------------------------------------------------------------------- #
+# product verification -- the standard excision already held itself to
+# --------------------------------------------------------------------------- #
+
+
+def test_a_route_that_destroys_a_protected_feature_is_refused(vector, donor, monkeypatch):
+    """``protect`` is now a post-condition, not only a hint for choosing cut sites.
+
+    Before this, ``protected`` steered ``_restriction_route`` and was then dropped: the
+    post-assembly checks covered length, insert presence, arm uniqueness and site regeneration,
+    but never re-checked that the protected features survived. ``excise._verify`` had always
+    done so, and insertion is the more error-prone operation of the two.
+
+    Simulated by corrupting the product after assembly, which is the failure the check exists to
+    catch however it arises.
+    """
+    from bbl import insert as insert_module
+
+    real_replace = insert_module.replace_span
+
+    def corrupting_replace(record, start, end, *args, **kwargs):
+        product = real_replace(record, start, end, *args, **kwargs)
+        # excise a chunk of the surviving backbone, i.e. destroy something protected
+        product.seq = product.seq[:200] + product.seq[400:]
+        return product
+
+    monkeypatch.setattr(insert_module, "replace_span", corrupting_replace)
+    with pytest.raises(NoInsertionRoute) as raised:
+        plan_insertion(vector, donor, insert_features=["Lambda BoxB x8"], at=SITE)
+    message = str(raised.value)
+    assert "length" in message or "not intact" in message
+
+
+def test_a_sound_product_verifies_clean(vector, donor):
+    """The same check must not fire on the known-good pCLM3 + pCLM1 -> pCLM2 route."""
+    plan = plan_insertion(vector, donor, insert_features=["Lambda BoxB x8"], at=SITE)
+    assert plan.inserted_bp >= BOXB_BP  # the restriction route carries 6 bp of donor flank
+    assert not any("not intact" in warning for warning in plan.warnings)
