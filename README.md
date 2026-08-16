@@ -1,3 +1,7 @@
+<p align="center">
+  <img src="assets/bbl-logo.png" alt="BBL — Build Better Loops" width="180">
+</p>
+
 # bbl
 
 reAGENT hackathon — agentic design of optimized plasmids from an inventory of library
@@ -352,4 +356,5 @@ tests/test_bench.py     reagent maths against the lab's own notebook spreadsheet
 tests/test_report.py    figure pruning, route coverage, nothing-invented invariants
 tests/test_sources.py   storage independence, incl. a synthetic Benchling store
 docs/DECISIONS.md       design rationale and course corrections
+assets/bbl-logo.png     the BBL mark (README header; the report embeds its own copy)
 ```

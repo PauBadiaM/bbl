@@ -88,6 +88,13 @@ BENCH_DEFAULTS = {
         "cycles": 30,
         "seconds_per_kb": 30,
         "seconds_per_kb_repetitive": 45,
+        #: Working dilution of the template. The ladder is the volumes the calculator is
+        #: allowed to make it up to -- it takes the smallest that still needs a pipettable
+        #: aliquot of stock -- and ``min_pipette_ul`` is what "pipettable" means here. A P2
+        #: goes lower, but 1 uL of a miniprep is the volume people actually measure
+        #: accurately at the end of a day.
+        "dilution_ladder_ul": [10, 20, 50, 100],
+        "min_pipette_ul": 1.0,
     },
     "transformation": {
         "cells_ul": 25,
@@ -215,6 +222,118 @@ class Reaction:
                 for row in self.rows
             ],
         }
+
+
+@dataclass
+class Dilution:
+    """Getting a miniprep stock down to the concentration a PCR wants.
+
+    The other live table in this module. A reaction mix turns a mass into a volume; this turns
+    a concentration into a pipetting sequence, and it has to stay live for the same reason --
+    the stock reading does not exist when the report is written.
+    """
+
+    title: str
+    template: str
+    target_ng_per_ul: float
+    ladder_ul: list
+    min_pipette_ul: float
+    #: ng/µL from the Nanodrop. ``None`` until somebody measures it.
+    ng_per_ul: float | None = None
+    note: str = ""
+
+    def plan(self) -> dict:
+        return dilution_plan(
+            self.ng_per_ul, self.target_ng_per_ul, self.ladder_ul, self.min_pipette_ul
+        )
+
+    def spec(self) -> dict:
+        """The calculation, as data, for the page to recompute against."""
+        return {
+            "target": self.target_ng_per_ul,
+            "ladder": list(self.ladder_ul),
+            "minPipette": self.min_pipette_ul,
+            "conc": self.ng_per_ul,
+        }
+
+
+def dilution_plan(stock, target, ladder=(10, 20, 50, 100), min_pipette=1.0) -> dict:
+    """How to get from ``stock`` ng/µL to ``target`` ng/µL, in moves you can actually pipette.
+
+    Reimplemented in JavaScript in :data:`bbl.report.html.SCRIPT`, so it is kept deliberately
+    plain and a test runs both over the same inputs. Three outcomes:
+
+    ``unknown``
+        no stock reading yet -- the box is a form to fill in, not a wrong answer.
+    ``neat``
+        the stock is already at or below the target; use it as it is rather than inventing a
+        dilution that would put too little DNA in the tube.
+    ``ok``
+        one or two steps. The single step is made up to the *smallest* volume in ``ladder``
+        that still needs at least ``min_pipette`` µL of stock, so nothing is wasted and nothing
+        is unmeasurable. When no volume in the ladder qualifies -- 1 ng/µL from a 500 ng/µL
+        miniprep is 0.04 µL, which is a number rather than an action -- a 1:100 intermediate
+        goes in front of it, and the same rule then picks the final step.
+    """
+    if not stock or stock <= 0 or not target or target <= 0:
+        return {"status": "unknown", "steps": []}
+    if stock <= target:
+        return {"status": "neat", "steps": []}
+
+    def single(source):
+        for final in ladder:
+            take = target * final / source
+            if take >= min_pipette:
+                return float(final), take
+        return None
+
+    steps, source = [], float(stock)
+    while single(source) is None and len(steps) < 3:
+        final = min_pipette * 100
+        steps.append(
+            {
+                "source": "stock" if not steps else f"step {len(steps)}",
+                "take_ul": min_pipette,
+                "water_ul": final - min_pipette,
+                "final_ul": final,
+                "gives": source / 100,
+            }
+        )
+        source = source / 100
+
+    chosen = single(source)
+    if chosen is None:  # unreachable for any real miniprep; do not print a fiction
+        return {"status": "unknown", "steps": []}
+    final, take = chosen
+    steps.append(
+        {
+            "source": "stock" if not steps else f"step {len(steps)}",
+            "take_ul": take,
+            "water_ul": final - take,
+            "final_ul": final,
+            "gives": target,
+        }
+    )
+    return {"status": "ok", "steps": steps}
+
+
+def template_dilution(component: Component, cfg) -> Dilution:
+    """The dilution box that belongs beside a PCR: stock in, working template out."""
+    pcr = cfg["pcr"]
+    target = pcr["template_ng_per_ul"]
+    return Dilution(
+        title=f"Template dilution — {component.name}",
+        template=component.name,
+        target_ng_per_ul=target,
+        ladder_ul=list(pcr["dilution_ladder_ul"]),
+        min_pipette_ul=pcr["min_pipette_ul"],
+        ng_per_ul=component.ng_per_ul,
+        note=(
+            f"{pcr['template_ul']:g} µL of the final dilution goes into the reaction above. "
+            "Mix each step and spin it down before taking the next aliquot — an unmixed "
+            "dilution is the usual reason a PCR that worked last week does not."
+        ),
+    )
 
 
 def ng_to_fmol(ng: float, length_bp: int, mw_per_bp: int = MW_PER_BP) -> float:
@@ -535,7 +654,9 @@ def pcr_table(cfg) -> Table:
         rows=rows,
         note=(
             "Set up on ice: KAPA HiFi HotStart has enough proofreading activity to chew the "
-            "primers at room temperature. Dilute the template to 1 ng/µL first."
+            f"primers at room temperature. The template goes in at "
+            f"{pcr['template_ng_per_ul']:g} ng/µL — the box below works out the dilution from "
+            "whatever the stock reads."
         ),
     )
 

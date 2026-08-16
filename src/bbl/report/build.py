@@ -32,6 +32,12 @@ REPEAT_ARRAY_MIN = 3
 class Figure:
     svg: str
     caption: str
+    #: Whether the figure needs the full page width. The circular maps pair up in two columns;
+    #: a linear zoom is a wide strip of 9 pt labels and is illegible at half that. Carried on
+    #: the figure rather than inferred from its position in the list, because the parent maps
+    #: are only emitted when a parent record was supplied -- and by position, a report built
+    #: without one puts its linear panel in the narrow column.
+    wide: bool = False
 
 
 @dataclass
@@ -124,6 +130,19 @@ def _component(record_or_name, length=None, concentrations=None):
     if length is None and not isinstance(record_or_name, str):
         length = len(record_or_name)
     return Component(str(name), length, (concentrations or {}).get(str(name)))
+
+
+def _template_component(record, fallback_name, concentrations=None):
+    """The plasmid a PCR is primed off, named however well we can name it.
+
+    ``record`` is the intact plasmid -- not the fragment the plan names, which does not exist
+    until the PCR has run. It is optional everywhere in this module, so fall back to the
+    fragment's own name: a dilution box headed "the template" is still worth having, and is
+    better than declining to show the arithmetic because nobody passed the record.
+    """
+    if record is not None:
+        return _component(record, concentrations=concentrations)
+    return _component(str(fallback_name), concentrations=concentrations)
 
 
 def _short(name) -> str:
@@ -290,7 +309,7 @@ def _excision_steps(plan, parent, cfg, repetitive, stock=None) -> list[Step]:
     return steps
 
 
-def _pcr_deletion_steps(plan, parent, cfg, repetitive) -> list[Step]:
+def _pcr_deletion_steps(plan, parent, cfg, repetitive, stock=None) -> list[Step]:
     """Delete by inverse PCR and re-circularization."""
     anneal = min(plan.forward.tm, plan.reverse.tm) - 2
     gibson = plan.method == "gibson"
@@ -315,6 +334,9 @@ def _pcr_deletion_steps(plan, parent, cfg, repetitive) -> list[Step]:
             body=body,
             tables=[
                 bench.pcr_table(cfg),
+                bench.template_dilution(
+                    _template_component(parent, "the parent plasmid", stock), cfg
+                ),
                 bench.thermocycler_table(anneal, plan.amplicon_bp, cfg, repetitive=repetitive),
             ],
             record=["Yield (ng/µL)"],
@@ -468,6 +490,10 @@ def _insertion_steps(plan, vector_record, cfg, repetitive, donor=None, stock=Non
         anneal = min(p.tm for p in plan.vector.primers) - 2
         prepare.tables = [
             bench.pcr_table(cfg),
+            # The template here is the intact vector, not the opened fragment the plan names.
+            bench.template_dilution(
+                _template_component(vector_record, plan.vector.name, stock), cfg
+            ),
             bench.thermocycler_table(anneal, plan.vector.length, cfg, repetitive=repetitive),
         ]
     elif plan.vector.enzymes:
@@ -487,6 +513,8 @@ def _insertion_steps(plan, vector_record, cfg, repetitive, donor=None, stock=Non
         anneal = min(p.tm for p in plan.insert.primers) - 2
         second.tables = [
             bench.pcr_table(cfg),
+            # ...and here it is the whole donor plasmid, for the same reason.
+            bench.template_dilution(donor_component, cfg),
             bench.thermocycler_table(anneal, plan.insert.length, cfg, repetitive=repetitive),
         ]
     if plan.insert.order_sequence:
@@ -529,16 +557,63 @@ def _insertion_steps(plan, vector_record, cfg, repetitive, donor=None, stock=Non
 # ---------------------------------------------------------------------------
 
 
-def _strategy_lines(plan, parent, product) -> list[str]:
+def _donor_described(fragment, donor) -> str | None:
+    """``pCLM1_… (5,400 bp)`` for the plasmid an insert came out of, or ``None`` if synthetic.
+
+    Two sources, in order of quality. A ``donor`` record passed to :func:`build_report` has
+    already been renamed to the full inventory label, so it wins; failing that the plan itself
+    carries the donor's own 16-character LOCUS name (``Fragment.donor_name``), which is worse
+    to read but is still the difference between naming the tube and not naming it.
+    """
+    if donor is not None:
+        return f"{donor.name} ({len(donor):,} bp)"
+    if not fragment.donor_name:
+        return None
+    length = fragment.donor_length
+    return f"{fragment.donor_name} ({length:,} bp)" if length else str(fragment.donor_name)
+
+
+def _insert_line(plan, donor) -> str:
+    """Where the insert comes from and how it is obtained, in one line.
+
+    The backbone has always been named on its own line; this is the same courtesy for the
+    other half of the reaction. Which of the three forms applies is read off the ``Fragment``
+    fields the planner already sets -- ``enzymes`` for a band cut out of a donor, ``primers``
+    for one amplified off it, ``order_sequence`` for DNA that does not exist yet.
+    """
+    insert = plan.insert
+    head = f"Insert: {insert.name}, {plan.inserted_bp:,} bp"
+    if insert.order_sequence:
+        return f"{head}, ordered as a synthetic fragment — no donor plasmid."
+
+    described = _donor_described(insert, donor)
+    if described is None:
+        return f"{head}."
+    if insert.primers:
+        forward, reverse = insert.primers
+        return (
+            f"{head}, PCR-amplified from {described} with "
+            f"{forward.name} + {reverse.name}."
+        )
+    if insert.enzymes:
+        return f"{head}, from {described} — cut out with {' + '.join(insert.enzymes)}."
+    return f"{head}, from {described}."
+
+
+def _strategy_lines(plan, parent, product, donor=None) -> list[str]:
     """The two-or-three-line summary a notebook entry opens with."""
     from ..insert import RESTRICTION
     from ..pcr import DeletionPCR
 
     parent_name = getattr(parent, "name", "the parent")
+    # ``parent`` is optional throughout ``build_report`` -- a plan carries its own product but
+    # not necessarily the record it started from -- so the length is only stated when it is
+    # known, rather than crashing on len(None).
+    described = f"{parent_name} ({len(parent):,} bp)" if parent is not None else parent_name
     if hasattr(plan, "enzyme_pair") and hasattr(plan, "deleted_bp"):
         enzymes = list(dict.fromkeys(plan.enzymes))
         return [
-            f"Backbone: {parent_name} ({len(parent):,} bp).",
+            f"Backbone: {described}.",
             f"Cut with {' + '.join(enzymes)}"
             + (" (cuts twice, flanking the target)" if len(enzymes) == 1 else "")
             + ", gel-purify the backbone, religate.",
@@ -548,7 +623,7 @@ def _strategy_lines(plan, parent, product) -> list[str]:
         ]
     if isinstance(plan, DeletionPCR):
         return [
-            f"Backbone: {parent_name} ({len(parent):,} bp).",
+            f"Backbone: {described}.",
             f"Inverse-PCR outward from the deletion boundaries with {plan.forward.name} + "
             f"{plan.reverse.name} ({plan.amplicon_bp:,} bp amplicon), DpnI, then "
             + ("Gibson self-assembly." if plan.method == "gibson" else "blunt self-ligation."),
@@ -556,11 +631,13 @@ def _strategy_lines(plan, parent, product) -> list[str]:
             f"{plan.deleted_bp:,} bp exactly, no collateral loss.",
             f"Product: {len(product):,} bp.",
         ]
-    lines = [
-        f"Backbone: {parent_name} ({len(parent):,} bp), opened at {plan.site[0]:,}–"
-        f"{plan.site[1]:,}.",
-        f"Insert: {plan.insert.name}, {plan.inserted_bp:,} bp.",
-    ]
+    backbone = f"Backbone: {described}, opened at {plan.site[0]:,}–{plan.site[1]:,}"
+    if plan.vector.primers:
+        # Otherwise the strategy reads as though the backbone were cut, and the reader only
+        # discovers there is a PCR to run when they reach step 1.
+        forward, reverse = plan.vector.primers
+        backbone += f", by inverse PCR with {forward.name} + {reverse.name}"
+    lines = [backbone + ".", _insert_line(plan, donor)]
     if plan.strategy == RESTRICTION:
         lines.append(
             f"Subclone with {' + '.join(plan.vector.enzymes)} — "
@@ -648,6 +725,7 @@ def _figures(plan, parent, product) -> list[Figure]:
                     salt="parent-linear",
                 ),
                 caption=f"{parent.name} around the edit, {window[0]:,}–{window[1]:,} bp.",
+                wide=True,
             )
         )
     product_window = zoom_window(
@@ -664,6 +742,7 @@ def _figures(plan, parent, product) -> list[Figure]:
                 salt="product-linear",
             ),
             caption=f"The product across the same region, in the parent's coordinate frame.",
+            wide=True,
         )
     )
     return figures
@@ -756,7 +835,7 @@ def build_report(
         ),
         meta=meta,
         aim=aim,
-        strategy=_strategy_lines(plan, parent, product),
+        strategy=_strategy_lines(plan, parent, product, donor=donor),
         plan_protocol=getattr(plan, "protocol", ""),
         warnings=list(getattr(plan, "warnings", [])),
     )
@@ -854,7 +933,7 @@ def build_report(
             plan, parent, cfg, bool(repeat), donor=donor, stock=concentrations
         )
     elif isinstance(plan, DeletionPCR):
-        steps = _pcr_deletion_steps(plan, parent, cfg, bool(repeat))
+        steps = _pcr_deletion_steps(plan, parent, cfg, bool(repeat), stock=concentrations)
     else:
         steps = _excision_steps(plan, parent, cfg, bool(repeat), stock=concentrations)
 

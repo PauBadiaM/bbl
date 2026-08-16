@@ -962,3 +962,92 @@ broken.
 Prose questions still work and are still preferred. The split the system prompt now draws:
 anything you can carry to the end of your message goes there, answered at the `›` prompt;
 anything that has to be answered *before* the next tool call goes through `ask_user`.
+
+---
+
+# D85. Third pass on the report, from bench feedback
+
+Three changes, all from reading a generated report rather than the code.
+
+**The strategy names the insert's source plasmid, and provenance moved onto the plan.** The
+opening summary named the backbone and then said `Insert: Lambda BoxB x8, 294 bp` — full stop.
+Where that DNA comes from was in the Materials table (`donor for …`) and in the step prose, i.e.
+two scrolls away from the sentence that is supposed to tell you what you are doing. It now says
+which plasmid the fragment is cut out of or amplified off, with that plasmid's length and the
+enzymes or primers involved, and a synthetic insert says so explicitly instead of quietly
+omitting a donor.
+
+The interesting part is *where the fact lives*. `InsertSource` (`insert.py`) has always carried
+`donor`, but `plan_insertion` drops it when it builds the `Fragment`, so the report could only
+name the donor because `DesignSession` separately stashes `Product.donor` and hands it back
+through `build_report(donor=…)`. A plan is supposed to be a self-contained description of what
+to build; "who the donor was" is part of that description, not a caller's bookkeeping. So
+`Fragment` gained `donor_name` / `donor_length`, and `None` means synthetic — the same signal
+`InsertSource.synthetic` already used. The report still *prefers* the passed record, because
+that one has been renamed to the full inventory label and the plan only has the 16-character
+LOCUS (D82); the plan is the floor, not the ceiling.
+
+**A linear panel is as tall as its labels need.** The circular maps were fixed in D82; the
+linear zooms were still illegible on a crowded window, and the cause was ours, not the
+library's. `DnaFeaturesViewer` stacks colliding labels onto successive levels and sizes the
+figure to fit them — but only when it created the figure: `auto_figure_height = (ax is None)
+and (figure_height is None)`. `linear_svg` handed it an axes from a fixed `figsize=(9.4, 1.5)`,
+which turns that off. Its fallback, `ideal_yspan`, is the y-span at which one line of text
+measures half a data unit, but `finalize_ax` takes `max(ideal_yspan, natural ymax)` and the
+natural ymax grows with the level count while `ideal_yspan` is capped by the physical axis
+height. Past about six rows the level count wins and every further row divides the same inch
+and a half. On a 900 bp window of pFH2.72 — fifteen labels, eight of them `tet operator` — the
+names printed straight through each other.
+
+The fix is to plot, then measure, then resize: `plot()` returns `labels_data`, which records the
+final y of every stacked label, so the panel can be set to the library's own 0.4 inch per level
+after the fact. Resizing afterwards is safe because the text is placed in data coordinates and
+only the height changes — the width-dependent collision pass that chose those levels stays
+valid. Sizing up front is not possible: the level count is a result of the plot. Three smaller
+things came with it. `elevate_outline_annotations=True`, so labels form a band above the
+features instead of interleaving with them — the library defaults it off to save height, which
+is no longer scarce. `labels_spacing` back to the library default of 8, from a 6 that existed
+only to cram more labels onto each row of a canvas that could not grow. And the cut-site marks
+now measure each other and take a second row when they would collide, which the two ends of a
+short deletion always would.
+
+**Nothing is pruned to keep the panel short.** The obvious backstop — a `min_bp` scaled to the
+window, a label cap like the circular map's 14 — was considered and rejected. Showing the small
+features *is* what a zoom is for, and a 66 bp change is exactly the thing D83 said the linear
+panel exists to make visible. The height is allowed to grow instead, with a ceiling that is a
+guard against a pathological record rather than a design target. If a real plasmid ever reaches
+it, a pruning budget is the answer, not a shorter panel.
+
+**Which figures are full width is now the figure's own property.** `render_html` split the list
+by index — first two narrow, rest wide — but `_figures` only emits the parent maps when a parent
+record was supplied. Without one the list is `[product-circular, product-linear]` and the linear
+strip landed in a half-width column, 9 pt text at about 3 px. Latent before, much worse with
+taller panels. `Figure.wide` replaces the index arithmetic.
+
+**The template dilution is calculated, not left as an instruction.** `pcr_table` said "dilute
+the template to 1 ng/µL first" and stopped, which is a division the reader does in their head
+next to a machine. It is now a live box on the same pattern as the reaction mixes (D82): type
+the Nanodrop reading, get the pipetting sequence.
+
+What makes it worth writing rather than obvious is that the honest single-step answer is often
+unusable. 1 ng/µL from a 500 ng/µL miniprep in 20 µL is 0.04 µL of stock — a number, not an
+action, and printing it would be the same failure as the `____` cells D82 removed, just in the
+other direction. So the calculator picks the smallest volume in a ladder that still needs at
+least 1 µL of stock, and when none does, it puts a 1:100 intermediate in front and applies the
+same rule again. A test asserts the property that justifies the whole thing: no step ever asks
+for less than `min_pipette_ul`. Both numbers are `bench` config, because "what you can pipette
+accurately" is a lab's opinion about its own P2.
+
+The arithmetic exists twice, in Python and in the page, so it is pinned the way the reaction
+calculator is: a test runs the document's own `dilutionPlan` under node and compares both the
+numbers and the emitted markup against the Python side.
+
+**Two things logged and not fixed.** The before/after linear pair does not share a horizontal
+scale — `_figures` calls `zoom_window` separately for each, and `zoom_window` pads by a quarter
+of the span, so a deletion gets a wide parent window and a narrow product one. They share a
+coordinate *frame*, which is what the docstring claimed, but features do not line up vertically
+between the panels and a reader may reasonably expect them to. Fixing it means computing one
+window and padding the narrower side. Separately, `prune_features` breaks `limit` ties
+largest-first, which is right for a whole-plasmid ring and arguably backwards for a zoom, where
+the nearest features are the interesting ones; it does not bite today because the linear view
+sets no limit.

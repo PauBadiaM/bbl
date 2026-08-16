@@ -15,6 +15,7 @@ from bbl.report.bench import (
     Component,
     bench_config,
     digestion_table,
+    dilution_plan,
     fmol_to_ng,
     gel_percent,
     gibson_table,
@@ -22,6 +23,7 @@ from bbl.report.bench import (
     ligation_table,
     ng_to_fmol,
     pcr_table,
+    template_dilution,
     thermocycler_table,
 )
 
@@ -183,6 +185,83 @@ def test_extension_time_lengthens_for_a_repeat_array(cfg):
 
 def test_annealing_temperature_is_printed_as_given(cfg):
     assert _cell(thermocycler_table(61.6, 1000, cfg), "Annealing", 1) == "62 °C"
+
+
+# --------------------------------------------------------------------------- #
+# diluting the template
+# --------------------------------------------------------------------------- #
+
+
+def _plan(stock, cfg, target=1):
+    pcr = cfg["pcr"]
+    return dilution_plan(stock, target, pcr["dilution_ladder_ul"], pcr["min_pipette_ul"])
+
+
+def test_a_dilute_stock_needs_one_step(cfg):
+    plan = _plan(20, cfg)
+    assert plan["status"] == "ok"
+    assert len(plan["steps"]) == 1
+    step = plan["steps"][0]
+    assert (step["take_ul"], step["water_ul"], step["final_ul"]) == (1.0, 19.0, 20.0)
+
+
+def test_the_smallest_workable_volume_wins(cfg):
+    """Nothing is made up to 100 uL when 10 uL would do -- that is wasted stock and water."""
+    assert _plan(10, cfg)["steps"][0]["final_ul"] == 10.0
+
+
+def test_a_concentrated_miniprep_gets_a_serial_dilution(cfg):
+    """0.04 uL of a 500 ng/uL stock is a number, not an action. Two steps, both pipettable."""
+    plan = _plan(500, cfg)
+    assert [round(s["gives"], 3) for s in plan["steps"]] == [5.0, 1.0]
+    assert [s["source"] for s in plan["steps"]] == ["stock", "step 1"]
+    assert plan["steps"][0]["take_ul"] == 1.0
+
+
+@pytest.mark.parametrize("stock", [1.1, 2, 5, 20, 87.3, 250, 500, 1364, 2000, 9999])
+def test_no_step_ever_asks_for_an_unpipettable_volume(cfg, stock):
+    """The property that makes this box worth having at all."""
+    plan = _plan(stock, cfg)
+    assert plan["status"] == "ok"
+    for step in plan["steps"]:
+        assert step["take_ul"] >= cfg["pcr"]["min_pipette_ul"]
+        assert 0 <= step["water_ul"] <= step["final_ul"]
+        assert step["take_ul"] + step["water_ul"] == pytest.approx(step["final_ul"])
+
+
+@pytest.mark.parametrize("stock", [1.1, 20, 500, 1364, 9999])
+def test_the_last_step_lands_on_the_target(cfg, stock):
+    """Every step is a real dilution: what goes in over what it is made up to."""
+    source = stock
+    for step in _plan(stock, cfg)["steps"]:
+        assert source * step["take_ul"] / step["final_ul"] == pytest.approx(step["gives"])
+        source = step["gives"]
+    assert source == pytest.approx(cfg["pcr"]["template_ng_per_ul"])
+
+
+def test_an_unmeasured_stock_is_a_form_not_a_guess(cfg):
+    assert _plan(None, cfg) == {"status": "unknown", "steps": []}
+    assert _plan(0, cfg) == {"status": "unknown", "steps": []}
+
+
+def test_a_stock_already_at_the_target_is_used_neat(cfg):
+    assert _plan(1, cfg)["status"] == "neat"
+    assert _plan(0.4, cfg)["status"] == "neat"
+
+
+def test_the_box_picks_up_a_measured_concentration(cfg):
+    box = template_dilution(Component("pHL391", 5770, 1364), cfg)
+    assert box.ng_per_ul == 1364
+    assert box.plan()["status"] == "ok"
+    assert template_dilution(Component("pHL391", 5770), cfg).plan()["status"] == "unknown"
+
+
+def test_the_lab_can_move_the_target_and_the_ladder():
+    cfg = bench_config({"bench": {"pcr": {"template_ng_per_ul": 0.1,
+                                          "dilution_ladder_ul": [50]}}})
+    plan = template_dilution(Component("p", 5000, 50), cfg).plan()
+    assert plan["steps"][-1]["gives"] == pytest.approx(0.1)
+    assert plan["steps"][-1]["final_ul"] == 50
 
 
 def test_repeat_arrays_are_grown_cool():
