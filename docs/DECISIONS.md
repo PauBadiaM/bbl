@@ -916,3 +916,49 @@ This trades install weight for a guarantee, in the one direction that matters he
 `[claude]` extra is *not* being reconsidered on the same grounds: the agent transport is
 genuinely optional -- every domain test and the whole library work without it -- whereas a
 report without figures is a worse version of a thing you asked for.
+
+---
+
+# D84. The agent's questions were being answered by the CLI, not the user. ↺
+
+Reported from the bench as "there's a timer and it's too short to reply in time". There is no
+timer. What was happening is worse.
+
+The system prompt tells the model to ask before it designs, and the model reached for the tool
+Claude Code gives it for that: `AskUserQuestion`, which draws a dialog with labelled options.
+That dialog belongs to Claude Code's own terminal UI. Through the SDK transport there is no UI
+to draw it in, so the CLI answers on the user's behalf -- **"The user did not answer the
+questions."**, five milliseconds after the call, measured across three real sessions. bbl
+printed `→ AskUserQuestion` and moved on. The question, complete with the two carefully
+described options the model had spent a paragraph of reasoning on, was never shown to anyone.
+So a question that decided the whole route -- which backbone, whether the 5' ribozyme comes out
+-- was silently recorded as *declined to answer*, and the model then either guessed or asked
+again in prose one turn later. This is a fourth item for D77's list: the obvious configuration
+did not error, it just quietly did the wrong thing.
+
+Two changes, and they only make sense together.
+
+**`AskUserQuestion` is in `disallowed_tools`.** Not merely un-allowlisted -- removed from the
+model's context, so it cannot be chosen. A tool that cannot work in this transport should not be
+on the menu, or the model will keep picking it: it is the right tool for the job everywhere
+*else* it has ever seen this job.
+
+**`ask_user` is a bbl tool, and it blocks.** It renders the questions and their options in the
+terminal, reads a reply with `input()`, and returns the answers to the model in the same turn.
+There is no time limit, and the tool description says so, because "ask only what you cannot
+proceed without" is only honest advice if asking actually reaches someone. A letter picks an
+option and comes back as its label; anything that is not entirely made of selections is passed
+through verbatim, since the user is entitled to answer "neither, use pCLM21". Empty is a skip,
+which the description tells the model to treat as "state your assumption and carry on" -- never
+as agreement.
+
+Blocking inside a tool handler contradicted this module's own docstring, so two things were
+checked before doing it. The `input()` runs on a worker thread, so the turn keeps streaming
+while the user thinks -- the same reason `confirmation_gate` uses one. And the CLI puts no
+practical timeout on an in-process MCP call: the default is `1e8` ms, about 28 hours, and the
+idle timeout is disabled outright for `sdk` transports. Waiting is safe; the harness is what was
+broken.
+
+Prose questions still work and are still preferred. The split the system prompt now draws:
+anything you can carry to the end of your message goes there, answered at the `›` prompt;
+anything that has to be answered *before* the next tool call goes through `ask_user`.

@@ -1,4 +1,4 @@
-"""The ten design tools, as an in-process SDK MCP server.
+"""The design tools, as an in-process SDK MCP server.
 
 The wrappers are thin: they serialise a :class:`DesignSession` method to JSON and carry a
 description written for the model. Descriptions say *when* to call, not just what the tool does
@@ -9,13 +9,16 @@ The server runs in bbl's own process, so the handlers close over the live
 :class:`DesignSession` and product handles stay valid across turns. Importing this module
 requires ``claude-agent-sdk``; ``session.py`` does not.
 
-Handlers do no I/O and never block: ``session.py`` is pure-CPU biopython work. In particular
-nothing here calls ``input()`` -- the confirmation gate for outward-facing tools lives in
-``agent.py``'s ``can_use_tool`` callback, which can prompt without stalling the event loop.
+Every design handler is pure-CPU biopython work that neither blocks nor touches the terminal;
+the confirmation gate for the outward-facing ones lives in ``agent.py``'s ``can_use_tool``
+callback. ``ask_user`` is the one deliberate exception -- it waits on the person at the
+keyboard, for as long as they take (docs/DECISIONS.md D84) -- and it does that on a worker
+thread so the turn keeps streaming meanwhile.
 """
 
 from __future__ import annotations
 
+import asyncio
 import json
 
 from .session import DesignSession
@@ -141,11 +144,42 @@ path: Where to write, e.g. "protocol.md".
 """
 
 
+ASK_USER = """\
+Put a question to the user and wait for their answer.
+
+This is the only way you can reach the user before your message ends, and it does not return
+until they have replied -- there is no time limit, so a question you actually need answered is
+never lost. Call this when the answer changes what gets built and you cannot responsibly guess:
+which backbone to start from, whether a feature the user did not mention must be removed,
+whether a second cloning round is acceptable, what a stock read on the Nanodrop.
+
+Ask everything you need in one call. Do not use it for anything you can decide yourself, or to
+report progress, or to seek approval for writing a file -- that is confirmed separately. A
+question you can leave to the end of your message belongs there instead, in prose; the user
+answers that at the prompt.
+
+questions: The questions to ask, in order. Each is an object:
+    question: The question itself, one sentence.
+    header: Two or three words naming the choice, e.g. "Backbone". Optional.
+    options: The choices, each {"label": ..., "description": ...}. Leave it out for an open
+        question. The user can always answer in their own words instead of picking, and can
+        skip, so do not add "other" or "no preference" options yourself.
+An empty answer means that question was skipped: say what you are assuming and carry on.
+"""
+
+
+#: Returned when nothing is attached to the terminal -- a library caller driving the tools
+#: directly, or a test. The model is told the answer is unavailable rather than left to read an
+#: empty result as agreement.
+NO_ONE_TO_ASK = "there is no interactive user in this session; decide without an answer"
+
+
 REPORT_INPUTS = """\
 List the DNA stocks whose concentration the report's reaction volumes need.
 
 Call this **before** generate_report. Every volume in the digest and ligation tables is a mass
-divided by a ng/uL reading, so ask the user for the ones listed here and pass them to
+divided by a ng/uL reading, so ask the user for the ones listed here -- `ask_user` gets you the
+numbers before you write the report, rather than a turn later -- and pass them to
 generate_report. If they do not know them yet, say so and generate the report anyway -- those
 tables become input boxes they can fill in at the bench.
 
@@ -178,8 +212,13 @@ concentrations: Measured stocks in ng/uL, keyed by the plasmid names that report
 """
 
 
-def build_tools(session: DesignSession) -> list:
-    """Tool objects bound to one session."""
+def build_tools(session: DesignSession, ask=None) -> list:
+    """Tool objects bound to one session.
+
+    ``ask`` is the blocking callable that puts a question on the terminal and waits -- see
+    :func:`bbl.llm.chat.ask_questions`. Left as ``None``, ``ask_user`` reports that there is
+    nobody to ask, which is what a library caller or a test wants.
+    """
     from claude_agent_sdk import tool
 
     def ok(payload) -> dict:
@@ -241,6 +280,17 @@ def build_tools(session: DesignSession) -> list:
     async def save_protocol(args):
         return ok(session.save_protocol(args["product_id"], args["path"]))
 
+    @tool("ask_user", ASK_USER, {"questions": list})
+    async def ask_user(args):
+        questions = args.get("questions") or []
+        if ask is None:
+            return ok({"answers": [], "note": NO_ONE_TO_ASK})
+        # On a worker thread, for the same reason the confirmation gate uses one: the SDK is
+        # streaming this turn on our event loop and the user may take minutes to answer. The
+        # CLI puts no practical timeout on an in-process MCP call (it is ~28 h, and the idle
+        # timeout is off for "sdk" transports), so the wait itself is safe.
+        return ok({"answers": await asyncio.to_thread(ask, questions)})
+
     @tool("report_inputs", REPORT_INPUTS, {"product_id": str})
     async def report_inputs(args):
         return ok(session.dna_needing_concentration(args["product_id"]))
@@ -276,16 +326,19 @@ def build_tools(session: DesignSession) -> list:
         compare_product,
         export_product,
         save_protocol,
+        ask_user,
         report_inputs,
         generate_report,
     ]
 
 
-def build_server(session: DesignSession):
+def build_server(session: DesignSession, ask=None):
     """The in-process MCP server carrying this session's tools."""
     from claude_agent_sdk import create_sdk_mcp_server
 
-    return create_sdk_mcp_server(name=SERVER, version="0.1.0", tools=build_tools(session))
+    return create_sdk_mcp_server(
+        name=SERVER, version="0.1.0", tools=build_tools(session, ask=ask)
+    )
 
 
 def qualified_names(session: DesignSession) -> list[str]:

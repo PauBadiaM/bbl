@@ -54,13 +54,18 @@ def _clip(text: str, cap: int) -> str:
 
 
 def summarize_args(args) -> str:
-    """The one argument worth showing beside a tool call."""
+    """The one argument worth showing beside a tool call.
+
+    Scalars only. The fallback used to print whatever the first argument was, which for
+    ``ask_user`` meant a line of Python-repr'd question objects immediately above the same
+    questions rendered properly -- noise where the tool speaks for itself.
+    """
     if not isinstance(args, dict) or not args:
         return ""
     for key in _SUMMARY_KEYS:
-        if args.get(key):
+        if isinstance(args.get(key), (str, int, float)) and args[key]:
             return _clip(args[key], _ARG_CAP)
-    first = next((v for v in args.values() if v), None)
+    first = next((v for v in args.values() if v and isinstance(v, (str, int, float))), None)
     return _clip(first, _ARG_CAP) if first is not None else ""
 
 

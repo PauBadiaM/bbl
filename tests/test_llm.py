@@ -359,7 +359,7 @@ def test_spec_schema_tells_the_model_not_to_infer_exclusions():
 TOOL_NAMES = {
     "search_inventory", "inspect_plasmid", "plan_deletion", "plan_insertion",
     "source_sequence", "compare_product", "export_product", "save_protocol",
-    "report_inputs", "generate_report",
+    "ask_user", "report_inputs", "generate_report",
 }
 
 
@@ -685,6 +685,151 @@ def test_products_persist_across_turns(session):
     assert first != second
     assert {first, second} <= set(session.products)
     assert session.compare_product(first, PCLM1)["identical"]
+
+
+# --------------------------------------------------------------------------- #
+# asking the user a question, and waiting for the answer
+# --------------------------------------------------------------------------- #
+
+QUESTION = {
+    "question": "Which backbone should this start from?",
+    "header": "Backbone",
+    "options": [
+        {"label": "pFH4.16", "description": "9383 bp, TRE3GS already in place"},
+        {"label": "pFH2.116", "description": "9713 bp, larger ORF to remove"},
+    ],
+}
+
+
+def _answering(*replies):
+    """A stand-in for ``input()`` that gives one canned reply per question."""
+    queue = list(replies)
+    return lambda prompt="": queue.pop(0)
+
+
+def test_the_cli_s_own_question_dialog_is_taken_away(session, tmp_path):
+    """It cannot be drawn through this transport: the CLI answers it itself, in milliseconds,
+    with "The user did not answer the questions." -- a question the user never saw."""
+    pytest.importorskip("claude_agent_sdk")
+    from bbl.llm.agent import build_options
+
+    assert "AskUserQuestion" in build_options(session, env={}, cwd=tmp_path).disallowed_tools
+
+
+def test_ask_user_runs_unattended_so_it_is_not_confirmed_before_it_can_ask(session, tmp_path):
+    """Gating it would put a [y/N] in front of the question itself."""
+    pytest.importorskip("claude_agent_sdk")
+    from bbl.llm.agent import build_options, confirmation_gate
+    from bbl.llm.tools import OUTWARD_FACING
+
+    assert "ask_user" not in OUTWARD_FACING
+    assert "mcp__bbl__ask_user" in build_options(session, env={}, cwd=tmp_path).allowed_tools
+    gate = confirmation_gate(lambda q: pytest.fail("asking must not need confirming"), tmp_path)
+    assert _gate_decision(gate, "mcp__bbl__ask_user", {}).behavior == "allow"
+
+
+def test_ask_user_hands_the_answer_back_to_the_model(session):
+    pytest.importorskip("claude_agent_sdk")
+    from bbl.llm.tools import build_tools
+
+    asked = []
+    tools = {
+        t.name: t
+        for t in build_tools(
+            session, ask=lambda questions: asked.append(questions) or [{"answer": "pFH4.16"}]
+        )
+    }
+    result = asyncio.run(tools["ask_user"].handler({"questions": [QUESTION]}))
+    payload = json.loads(result["content"][0]["text"])
+    assert asked == [[QUESTION]]
+    assert payload["answers"] == [{"answer": "pFH4.16"}]
+
+
+def test_ask_user_with_nobody_to_ask_says_so_rather_than_inventing_an_answer(session):
+    """A library caller or a test drives the tools with no terminal attached. An empty answer
+    must not read as agreement."""
+    pytest.importorskip("claude_agent_sdk")
+    from bbl.llm.tools import NO_ONE_TO_ASK, build_tools
+
+    tools = {t.name: t for t in build_tools(session)}
+    payload = json.loads(
+        asyncio.run(tools["ask_user"].handler({"questions": [QUESTION]}))["content"][0]["text"]
+    )
+    assert payload["answers"] == [] and payload["note"] == NO_ONE_TO_ASK
+
+
+def test_a_question_is_rendered_with_its_options_and_the_answer_comes_back(monkeypatch, capsys):
+    from bbl.llm import chat
+
+    monkeypatch.setattr("builtins.input", _answering("b"))
+    answers = chat.ask_questions([QUESTION])
+
+    out = capsys.readouterr().out
+    assert "Which backbone should this start from?" in out
+    assert "a) pFH4.16" in out and "b) pFH2.116" in out
+    assert "9713 bp" in out  # the descriptions are what make the choice answerable
+    assert answers == [
+        {
+            "question": QUESTION["question"],
+            "header": "Backbone",
+            "answer": "pFH2.116",  # the label, not the letter the user typed
+        }
+    ]
+
+
+def test_free_text_is_taken_verbatim_and_a_selection_is_resolved(monkeypatch):
+    from bbl.llm import chat
+
+    monkeypatch.setattr("builtins.input", _answering("neither -- use pCLM21", "1", "a,b", ""))
+    open_question = {"question": "How much material do you need?"}
+    replies = [
+        chat.ask_questions([QUESTION])[0]["answer"],
+        chat.ask_questions([QUESTION])[0]["answer"],
+        chat.ask_questions([QUESTION])[0]["answer"],
+        chat.ask_questions([open_question])[0]["answer"],
+    ]
+    assert replies == ["neither -- use pCLM21", "pFH4.16", "pFH4.16, pFH2.116", ""]
+
+
+def test_an_abandoned_round_still_reports_every_question(monkeypatch):
+    """Ctrl-C or EOF stops the asking; the questions still come back, unanswered, so the model
+    knows what it is proceeding without."""
+    from bbl.llm import chat
+
+    def refuse(prompt=""):
+        raise EOFError
+
+    monkeypatch.setattr("builtins.input", refuse)
+    answers = chat.ask_questions([QUESTION, {"question": "Second thing?"}])
+    assert [a["answer"] for a in answers] == ["", ""]
+    assert [a["question"] for a in answers] == [QUESTION["question"], "Second thing?"]
+
+
+def test_a_question_carries_no_countdown_of_any_kind(monkeypatch):
+    """The bug this whole path exists to fix: nothing may expire while the user is thinking."""
+    from bbl.llm import chat
+
+    waited = []
+
+    def slow(prompt=""):
+        waited.append(prompt)
+        return "a"
+
+    monkeypatch.setattr("builtins.input", slow)
+    assert chat.ask_questions([QUESTION])[0]["answer"] == "pFH4.16"
+    assert waited and "skip" in waited[0]  # skipping is the user's choice, never the clock's
+
+
+def test_the_question_payload_is_not_dumped_next_to_the_tool_call(capsys):
+    """The questions are about to be rendered properly; a repr of them above that is noise."""
+    from bbl.llm.render import Renderer, Style
+
+    renderer = Renderer(Style(enabled=False))
+    renderer.handle(_Msg([_Block(type="tool_use", name="mcp__bbl__ask_user",
+                                input={"questions": [QUESTION]})]))
+    out = capsys.readouterr().out
+    assert "→ ask_user" in out
+    assert "question" not in out.lower().replace("→ ask_user", "")
 
 
 # --------------------------------------------------------------------------- #

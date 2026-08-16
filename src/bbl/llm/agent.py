@@ -26,6 +26,15 @@ DEFAULT_MODEL = os.environ.get("BBL_MODEL") or "claude-opus-5"
 #: whichever layer catches it (docs/DECISIONS.md D69).
 DECLINED = "the user declined; do not retry, ask what they want instead"
 
+#: Built-in CLI tools kept out of the model's context entirely.
+#:
+#: ``AskUserQuestion`` draws a dialog in Claude Code's own terminal UI. Through the SDK
+#: transport there is no UI to draw it in, so the CLI answers it itself: measured on real bbl
+#: sessions, it returns "The user did not answer the questions." about five milliseconds after
+#: the call -- a question the user never saw and had no way to reply to. bbl's own ``ask_user``
+#: tool is the one that reaches the terminal, and it waits. See docs/DECISIONS.md D84.
+DISALLOWED_TOOLS = ("AskUserQuestion",)
+
 
 @dataclass
 class Turn:
@@ -45,6 +54,7 @@ def build_options(
     model: str = DEFAULT_MODEL,
     effort: str = "high",
     can_use_tool=None,
+    ask=None,
     resume: str | None = None,
 ):
     """Options for a bbl design session.
@@ -72,6 +82,11 @@ def build_options(
     starts reasoning about why they are unauthorized, mid-cloning-design.
     ``CLAUDE_CODE_DISABLE_CLAUDE_MDS`` is the third, set in :func:`bbl.llm.auth.agent_env`,
     because project discovery walks *up* from cwd.
+
+    ``ask`` is how the model reaches the person at the keyboard mid-turn: it backs the
+    ``ask_user`` tool and blocks until they answer. Paired with :data:`DISALLOWED_TOOLS`, which
+    takes away the CLI's own question dialog -- through this transport that dialog answers
+    itself, and the user never sees the question.
     """
     from claude_agent_sdk import ClaudeAgentOptions
 
@@ -81,9 +96,10 @@ def build_options(
         env=env,
         model=model,
         system_prompt=build_system_prompt(session.entries, session.config),
-        mcp_servers={"bbl": build_server(session)},
+        mcp_servers={"bbl": build_server(session, ask=ask)},
         strict_mcp_config=True,
         allowed_tools=[*unattended, "Read"],
+        disallowed_tools=list(DISALLOWED_TOOLS),
         setting_sources=[],
         permission_mode="default",
         can_use_tool=can_use_tool,

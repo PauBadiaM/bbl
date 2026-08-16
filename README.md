@@ -207,6 +207,15 @@ bbl -- 28 plasmids from ~/constructs
   be present, the selection marker, and the host.
 
 › pHL391 with NFKBRE removed. Nothing else should change.
+  → ask_user
+
+  ⁇ pHL391 also carries a LambdaBoxB x8 array you did not mention. Keep it?
+    a) Keep it
+       It is in pCLM1, the construct this route lands on.
+    b) Remove it too
+       A second cloning round, ~4 more days.
+  answer (a/b, your own words, or Enter to skip) › a
+  ✓ 61 chars
   → inspect_plasmid: pHL391
   ✓ 3751 chars
   → plan_deletion: pHL391
@@ -234,6 +243,15 @@ bbl -- 28 plasmids from ~/constructs
     2. Double digest MfeI + EcoRI
     ...
 ```
+
+**When it needs an answer, it waits.** A question you can leave to the end of a message is asked
+in prose and answered at the `›` prompt; one the route forks on — which backbone, whether a
+feature you did not mention has to come out — is put on the terminal mid-turn by `ask_user`,
+which blocks until you reply. Nothing expires while you go and check: press Enter to skip and
+the model is told to state its assumption instead of taking the silence for a yes. Claude Code's
+own `AskUserQuestion` dialog is deliberately taken away from the agent, because it cannot be
+drawn through this transport and answers itself in five milliseconds
+([D84](docs/DECISIONS.md)).
 
 **Credentials** resolve the way [`acumen`](https://github.com/scverse/acumen) does it: your
 **Claude subscription** first (the OAuth login in `~/.claude/.credentials.json`, or

@@ -16,8 +16,10 @@ import asyncio
 import contextlib
 import json
 import os
+import shutil
 import signal
 import sys
+import textwrap
 import warnings
 from pathlib import Path
 
@@ -73,6 +75,135 @@ async def _ask_concentrations(session, handle) -> dict:
         if answer.strip():
             supplied[item["plasmid"]] = answer.strip()
     return supplied
+
+
+#: Options are offered as letters: one keystroke picks one, and any longer reply is
+#: unambiguously the user's own words. More than 26 choices is not a question.
+_LETTERS = "abcdefghijklmnopqrstuvwxyz"
+
+
+def _options(item) -> list[dict]:
+    """The offered choices, normalised to ``{label, description}``.
+
+    Defensive because the shape comes from the model: options may arrive as plain strings or as
+    objects, and an entry with no label is nothing we can offer.
+    """
+    raw = item.get("options") if isinstance(item, dict) else None
+    options = []
+    for option in raw or []:
+        if isinstance(option, dict):
+            label = str(option.get("label") or option.get("name") or "").strip()
+            description = str(option.get("description") or "").strip()
+        else:
+            label, description = str(option).strip(), ""
+        if label:
+            # A description that just repeats the label is what a model writes when the option
+            # needs none; printing it twice reads as a rendering bug.
+            options.append(
+                {"label": label, "description": "" if description == label else description}
+            )
+    return options[: len(_LETTERS)]
+
+
+def _wrap(text: str, indent: str, first: str | None = None) -> str:
+    """Fill to the terminal, hanging-indented so a wrapped line lines up under the first."""
+    width = max(min(shutil.get_terminal_size((80, 24)).columns, 88), 40)
+    return textwrap.fill(
+        text, width=width, initial_indent=first or indent, subsequent_indent=indent
+    )
+
+
+def _pick(reply: str, options: list[dict]) -> str:
+    """Resolve a reply against the offered options: ``"b"`` -> that option's label.
+
+    Letters and numbers select, comma- or space-separated for a multi-select question. Anything
+    that is not entirely made of selections is taken verbatim -- the user is allowed to answer
+    with a plasmid name, a caveat, or a question of their own, and silently mapping half of that
+    onto an option would put words in their mouth.
+    """
+    if not options:
+        return reply
+    picks = [p for p in reply.replace(",", " ").split() if p]
+    labels = []
+    for pick in picks:
+        token = pick.lower()
+        if len(token) == 1 and token in _LETTERS:
+            index = _LETTERS.index(token)
+        elif token.isdigit():
+            index = int(token) - 1
+        else:
+            return reply
+        if not 0 <= index < len(options):
+            return reply
+        labels.append(options[index]["label"])
+    return ", ".join(labels) if labels else reply
+
+
+def ask_questions(questions) -> list[dict]:
+    """Put the agent's questions on the terminal and wait, however long it takes.
+
+    This backs the ``ask_user`` tool, and it is the whole reason that tool exists: the CLI's own
+    ``AskUserQuestion`` dialog cannot be drawn through the SDK transport, so it answers itself
+    within milliseconds and the user never sees the question (docs/DECISIONS.md D84). Here the
+    question is printed and ``input()`` blocks. Nothing expires.
+
+    Runs on a worker thread -- ``tools.ask_user`` puts it there -- so a turn keeps streaming
+    while the user thinks.
+
+    Answers come back in the order asked, each tagged with the question it belongs to. An empty
+    answer means skipped, which the tool description tells the model to treat as "state your
+    assumption and carry on" rather than as consent.
+    """
+    answers: list[dict] = []
+    abandoned = False
+    for item in questions or []:
+        record = {"question": _question_text(item)}
+        header = str(item.get("header") or "").strip() if isinstance(item, dict) else ""
+        if header:
+            record["header"] = header
+        if abandoned:
+            answers.append({**record, "answer": ""})
+            continue
+
+        options = _options(item)
+        _show_question(record["question"], options)
+        try:
+            reply = input(f"{STYLE.bold}  answer ({_hint(options)}) › {STYLE.reset}")
+        except (EOFError, KeyboardInterrupt):
+            # The user has said, one way or another, that they are not answering right now, so
+            # stop asking. The remaining questions still come back unanswered rather than being
+            # dropped, so the model knows what it is proceeding without.
+            print()
+            answers.append({**record, "answer": ""})
+            abandoned = True
+            continue
+        reply = reply.strip()
+        answer = _pick(reply, options)
+        if answer != reply:
+            _dim(f"→ {answer}")  # a letter is short to type and easy to mis-hit: echo the choice
+        answers.append({**record, "answer": answer})
+    return answers
+
+
+def _question_text(item) -> str:
+    if not isinstance(item, dict):
+        return str(item).strip()
+    return str(item.get("question") or item.get("header") or "").strip()
+
+
+def _hint(options: list[dict]) -> str:
+    if not options:
+        return "Enter to skip"
+    return f"{'/'.join(_LETTERS[: len(options)])}, your own words, or Enter to skip"
+
+
+def _show_question(question: str, options: list[dict]) -> None:
+    print()
+    print(f"{STYLE.bold}{_wrap(question, '    ', first='  ⁇ ')}{STYLE.reset}")
+    for letter, option in zip(_LETTERS, options):
+        print(f"    {letter}) {option['label']}")
+        if option["description"]:
+            print(f"{STYLE.dim}{_wrap(option['description'], '       ')}{STYLE.reset}")
 
 
 def _ask(prompt: str) -> bool:
@@ -291,6 +422,7 @@ async def converse(
         model=model,
         effort=effort,
         can_use_tool=confirmation_gate(_ask, cwd),
+        ask=ask_questions,
         resume=resume,
     )
 
