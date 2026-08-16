@@ -1,4 +1,4 @@
-"""The eight design tools, as an in-process SDK MCP server.
+"""The ten design tools, as an in-process SDK MCP server.
 
 The wrappers are thin: they serialise a :class:`DesignSession` method to JSON and carry a
 description written for the model. Descriptions say *when* to call, not just what the tool does
@@ -21,7 +21,7 @@ import json
 from .session import DesignSession
 
 #: Tools that change something outside the process. Gated before execution.
-OUTWARD_FACING = {"export_product", "save_protocol"}
+OUTWARD_FACING = {"export_product", "save_protocol", "generate_report"}
 
 #: The MCP server name. Tool names reach ``allowed_tools`` as ``mcp__bbl__<tool>``.
 SERVER = "bbl"
@@ -132,8 +132,49 @@ rendered from the verified plan and appended below your message after you have f
 writing, so there is nothing for you to copy into a generic file-writing tool. This tool takes
 the protocol straight from the plan, so what lands on disk is exact.
 
+This is the plain-text one: the steps, nothing else, for pasting into notes or a message. When
+the user is actually going to build the construct, generate_report is the better answer -- it
+carries the same protocol plus the reaction volumes, gels and maps they will need at the bench.
+
 product_id: A handle returned by a plan tool, e.g. "prod_1".
 path: Where to write, e.g. "protocol.md".
+"""
+
+
+REPORT_INPUTS = """\
+List the DNA stocks whose concentration the report's reaction volumes need.
+
+Call this **before** generate_report. Every volume in the digest and ligation tables is a mass
+divided by a ng/uL reading, so ask the user for the ones listed here and pass them to
+generate_report. If they do not know them yet, say so and generate the report anyway -- those
+tables become input boxes they can fill in at the bench.
+
+product_id: A handle returned by a plan tool, e.g. "prod_1".
+"""
+
+
+GENERATE_REPORT = """\
+Write a bench-ready cloning report for a designed product: procedure, reagent tables and
+plasmid maps, as one self-contained HTML file.
+
+Call this when the user is going to actually build the construct, or asks for a protocol, a
+write-up, a notebook entry or something to send to a colleague. It writes to disk, so only call
+it once a route has been chosen. Everything in it is generated from the verified plan -- you do
+not need to, and should not, draft the procedure yourself. Prefer this over save_protocol
+whenever the destination is the bench rather than a chat message.
+
+Check report_inputs first and ask the user for the stock concentrations; passing them turns the
+reaction tables from a form into a protocol. Anything you leave out stays an input box in the
+report, which is fine -- never invent a concentration.
+
+product_id: A handle returned by a plan tool, e.g. "prod_1".
+path: Where to write, e.g. "pCLM1_report.html".
+aim: One sentence on why this construct is being made, in the user's own terms. Leave empty if
+    they have not said. Do not restate the cloning strategy here.
+name: What to call the construct in the report, e.g. "pCLM1_designed". Leave empty to use the
+    name the plan gave it.
+concentrations: Measured stocks in ng/uL, keyed by the plasmid names that report_inputs
+    returned, e.g. {"pHL391_pcDNA3.1_NFKBRE1-...": 1364}. Omit any the user has not measured.
 """
 
 
@@ -200,6 +241,32 @@ def build_tools(session: DesignSession) -> list:
     async def save_protocol(args):
         return ok(session.save_protocol(args["product_id"], args["path"]))
 
+    @tool("report_inputs", REPORT_INPUTS, {"product_id": str})
+    async def report_inputs(args):
+        return ok(session.dna_needing_concentration(args["product_id"]))
+
+    @tool(
+        "generate_report",
+        GENERATE_REPORT,
+        {
+            "product_id": str,
+            "path": str,
+            "aim": str,
+            "name": str,
+            "concentrations": dict,
+        },
+    )
+    async def generate_report(args):
+        return ok(
+            session.generate_report(
+                args["product_id"],
+                args["path"],
+                aim=args.get("aim") or None,
+                name=args.get("name") or None,
+                concentrations=args.get("concentrations") or None,
+            )
+        )
+
     return [
         search_inventory,
         inspect_plasmid,
@@ -209,6 +276,8 @@ def build_tools(session: DesignSession) -> list:
         compare_product,
         export_product,
         save_protocol,
+        report_inputs,
+        generate_report,
     ]
 
 

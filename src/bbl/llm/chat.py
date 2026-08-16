@@ -30,6 +30,7 @@ bbl -- {n} plasmids from {dir}
 
   Commands:  /products    list designed products
              /protocol N  show the protocol for prod_N
+             /report N    write a bench-ready HTML report for prod_N
              /library P   switch to a different plasmid library
              /reset       start the conversation over (products are kept)
              /quit
@@ -44,6 +45,34 @@ STATE_DIR = ".bbl"
 STATE_FILE = "session.json"
 
 STYLE = Style()
+
+
+async def _ask_concentrations(session, handle) -> dict:
+    """Ask for the Nanodrop readings the reaction volumes need. Blank means 'not yet'.
+
+    Worth interrupting for: two numbers turn every volume in the report from a blank into a
+    figure. Skipping is free -- the tables stay live in the browser either way.
+
+    Read on a worker thread for the same reason ``converse`` reads the prompt there: this runs
+    on the event loop the SDK client is attached to, and a blocking ``input()`` would stall it
+    for as long as the user takes to find the number.
+    """
+    needed = session.dna_needing_concentration(handle)
+    if not needed:
+        return {}
+    _dim("stock concentrations for the reaction volumes (Enter to skip)")
+    supplied = {}
+    for item in needed:
+        try:
+            answer = await asyncio.to_thread(
+                input, f"  {item['plasmid']} ({item['role']}) ng/µL: "
+            )
+        except (EOFError, KeyboardInterrupt):
+            print()
+            return supplied
+        if answer.strip():
+            supplied[item["plasmid"]] = answer.strip()
+    return supplied
 
 
 def _ask(prompt: str) -> bool:
@@ -165,7 +194,30 @@ async def _interruptible_turn(client, prompt: str, renderer):
             loop.remove_signal_handler(signal.SIGINT)
 
 
-def _handle_command(line: str, session: DesignSession) -> str | None:
+def _resolve_handle(argument: str, session: DesignSession) -> str:
+    """``"2"`` | ``"prod_2"`` | ``""`` -> a product handle. Empty means the most recent one."""
+    handle = argument or (list(session.products) or [""])[-1]
+    return handle if handle.startswith("prod_") else f"prod_{handle}"
+
+
+def report_digest(record: dict) -> str:
+    """What a written report looks like in the terminal: the path, then what is in it.
+
+    The step titles, not the protocol body. The protocol is already appended after any turn
+    that designs a product (D64), and printing it a second time here would double it on the
+    common path where a report is written in the same turn the product was made.
+    """
+    lines = [
+        f"  wrote {record['path']} — {record['sections']} steps, {record['figures']} figures"
+    ]
+    lines += [f"    {title}" for title in record["steps"]]
+    if record["concentrations_missing"]:
+        missing = ", ".join(record["concentrations_missing"])
+        lines.append(f"    blank until measured: {missing}")
+    return "\n".join(lines)
+
+
+async def _handle_command(line: str, session: DesignSession) -> str | None:
     """Run a slash command. Returns a control word for the caller, or None if handled here."""
     command, _, argument = line[1:].partition(" ")
     argument = argument.strip()
@@ -186,12 +238,27 @@ def _handle_command(line: str, session: DesignSession) -> str | None:
             print(f"  {handle}  {len(product.record)} bp  ({product.origin})")
         return None
     if command == "protocol":
-        handle = argument or (list(session.products) or [""])[-1]
-        handle = handle if handle.startswith("prod_") else f"prod_{handle}"
+        handle = _resolve_handle(argument, session)
         if handle in session.products:
             print(session.protocol_for(handle))
         else:
             _dim(f"no such product: {handle}")
+        return None
+    if command == "report":
+        wanted, _, destination = argument.partition(" ")
+        handle = _resolve_handle(wanted.strip(), session)
+        if handle not in session.products:
+            _dim(f"no such product: {handle}")
+            return None
+        path = destination.strip() or f"{handle}_report.html"
+        concentrations = await _ask_concentrations(session, handle)
+        result = session.generate_report(handle, path, concentrations=concentrations)
+        # No confirmation gate on this path: the user typed the command and the destination,
+        # which is the thing the gate exists to establish. The gate covers the model.
+        if result.get("declined"):
+            _dim("not written")
+        else:
+            print(report_digest(session.reports[-1]))
         return None
 
     _dim("unknown command")
@@ -244,7 +311,7 @@ async def converse(
                 if not line:
                     continue
                 if line.startswith("/"):
-                    control = _handle_command(line, session)
+                    control = await _handle_command(line, session)
                     if control == "quit":
                         return 0
                     if control is not None:
@@ -253,6 +320,7 @@ async def converse(
                 pending = line
 
             before = set(session.products)
+            reports_before = len(session.reports)
             renderer = Renderer(STYLE)
             try:
                 turn = await _interruptible_turn(client, pending, renderer)
@@ -286,6 +354,11 @@ async def converse(
             protocols = new_protocols(session, before, turn.text)
             if protocols:
                 print(protocols)
+
+            # Same principle for reports: the model asked for the file, the harness says what
+            # landed. Identical output to the /report path, which shares report_digest.
+            for record in session.reports[reports_before:]:
+                print(report_digest(record))
 
 
 class _Restart(Exception):

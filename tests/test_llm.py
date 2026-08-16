@@ -195,6 +195,115 @@ def test_save_protocol_is_gated_and_rejects_unknown_handles(plasmid_dir, tmp_pat
 
 
 # --------------------------------------------------------------------------- #
+# reports
+# --------------------------------------------------------------------------- #
+
+
+def test_report_is_written_from_the_stored_plan(session, tmp_path):
+    handle = session.plan_deletion(PHL391, ["NFKBRE"])["product_id"]
+    out = session.generate_report(handle, str(tmp_path / "report.html"))
+    assert out["sections"] >= 4
+    html = (tmp_path / "report.html").read_text()
+    assert session.protocol_for(handle) in html.replace("&#x27;", "'")
+
+
+def test_a_report_cites_a_comparison_made_earlier(session, tmp_path):
+    """The verdict is remembered by the session, so the model cannot misreport it later."""
+    handle = session.plan_deletion(PHL391, ["NFKBRE"])["product_id"]
+    session.compare_product(handle, PCLM1)
+    session.generate_report(handle, str(tmp_path / "r.html"))
+    assert "identical to pCLM1" in (tmp_path / "r.html").read_text()
+
+
+def test_a_report_draws_the_parent_it_was_designed_from(session, tmp_path):
+    """Only worth asserting because the plan itself does not carry the parent record."""
+    handle = session.plan_deletion(PHL391, ["NFKBRE"])["product_id"]
+    session.generate_report(handle, str(tmp_path / "r.html"))
+    html = (tmp_path / "r.html").read_text()
+    assert "pHL391_pcDNA3.1_NFKBRE1-miniCMV-mCherry-LambdaBoxBx8 — 5,770 bp" in html
+    assert html.count("<svg") == 4  # both maps and both zooms; figures are not optional (D83)
+
+
+def test_a_report_names_plasmids_in_full(session, tmp_path):
+    """pCLM21 and pCLM24 differ only after the underscore; the short name is an accession."""
+    handle = session.plan_deletion(PHL391, ["NFKBRE"])["product_id"]
+    session.generate_report(handle, str(tmp_path / "r.html"))
+    html = (tmp_path / "r.html").read_text()
+    assert "NFKBRE1-miniCMV-mCherry-LambdaBoxBx8" in html
+
+
+def test_the_session_says_which_concentrations_it_needs(session):
+    """The prompt to ask the user is built from the design, not guessed at by the model."""
+    handle = session.plan_insertion(
+        "pCLM3", at=BOXB_SITE, donor=PCLM1, donor_features=["Lambda BoxB x8"]
+    )["product_id"]
+    needed = session.dna_needing_concentration(handle)
+    assert [item["role"] for item in needed] == ["parent / backbone", "donor"]
+    assert all(item["length_bp"] > 0 for item in needed)
+
+
+def test_supplied_concentrations_fill_the_volumes(session, tmp_path):
+    handle = session.plan_deletion(PHL391, ["NFKBRE"])["product_id"]
+    label = session.dna_needing_concentration(handle)[0]["plasmid"]
+    out = session.generate_report(
+        handle, str(tmp_path / "r.html"), concentrations={label: 100}
+    )
+    assert out["concentrations_supplied"] == [label]
+    assert out["concentrations_missing"] == []
+    # 1 ug at 100 ng/uL is 10 uL of DNA, leaving 6 uL of water in a 20 uL digest
+    assert ">10.00<" in (tmp_path / "r.html").read_text()
+
+
+def test_a_junk_concentration_is_dropped_rather_than_coerced(session, tmp_path):
+    handle = session.plan_deletion(PHL391, ["NFKBRE"])["product_id"]
+    label = session.dna_needing_concentration(handle)[0]["plasmid"]
+    out = session.generate_report(
+        handle, str(tmp_path / "r.html"), concentrations={label: "unknown"}
+    )
+    assert out["concentrations_supplied"] == []
+    assert out["concentrations_missing"] == [label]
+
+
+def test_report_writing_is_gated_like_any_other_write(plasmid_dir, tmp_path):
+    declining = DesignSession(plasmid_dir, confirm=lambda prompt: False)
+    handle = declining.plan_deletion(PHL391, ["NFKBRE"])["product_id"]
+    target = tmp_path / "nope.html"
+    assert declining.generate_report(handle, str(target))["declined"] is True
+    assert not target.exists()
+
+
+def test_report_rejects_an_unknown_handle(session):
+    assert "error" in session.generate_report("prod_999", "/tmp/x.html")
+
+
+def test_report_generation_is_declared_outward_facing():
+    from bbl.llm.tools import OUTWARD_FACING
+
+    assert "generate_report" in OUTWARD_FACING
+
+
+def test_a_written_report_is_remembered_for_the_harness_to_announce(session, tmp_path):
+    """The model asks for the file; the harness says what landed. Same split as D64."""
+    handle = session.plan_deletion(PHL391, ["NFKBRE"])["product_id"]
+    before = len(session.reports)
+    session.generate_report(handle, str(tmp_path / "r.html"))
+    assert len(session.reports) == before + 1
+    assert session.reports[-1]["steps"], "the digest is built from the step titles"
+    assert session.reports[-1]["path"].endswith("r.html")
+
+
+def test_a_report_digest_never_repeats_the_protocol(session, tmp_path):
+    """It prints beside the D64 protocol block, so overlapping would double it on screen."""
+    from bbl.llm.chat import report_digest
+
+    handle = session.plan_deletion(PHL391, ["NFKBRE"])["product_id"]
+    session.generate_report(handle, str(tmp_path / "r.html"))
+    digest = report_digest(session.reports[-1])
+    assert "r.html" in digest
+    assert session.protocol_for(handle) not in digest
+
+
+# --------------------------------------------------------------------------- #
 # prompt assembly
 # --------------------------------------------------------------------------- #
 
@@ -250,6 +359,7 @@ def test_spec_schema_tells_the_model_not_to_infer_exclusions():
 TOOL_NAMES = {
     "search_inventory", "inspect_plasmid", "plan_deletion", "plan_insertion",
     "source_sequence", "compare_product", "export_product", "save_protocol",
+    "report_inputs", "generate_report",
 }
 
 
@@ -294,6 +404,28 @@ def test_handlers_return_mcp_content_not_raw_payloads(session):
     result = asyncio.run(tools["inspect_plasmid"].handler({"plasmid": PHL391}))
     assert result["content"][0]["type"] == "text"
     assert json.loads(result["content"][0]["text"])["length_bp"] == 5770
+
+
+def test_the_report_handler_round_trips_a_concentrations_dict(session, tmp_path):
+    """The only tool taking a dict argument -- a schema that flattened it would be silent."""
+    pytest.importorskip("claude_agent_sdk")
+    from bbl.llm.tools import build_tools
+
+    handle = session.plan_deletion(PHL391, ["NFKBRE"])["product_id"]
+    label = session.dna_needing_concentration(handle)[0]["plasmid"]
+    tools = {t.name: t for t in build_tools(session)}
+    result = asyncio.run(
+        tools["generate_report"].handler(
+            {
+                "product_id": handle,
+                "path": str(tmp_path / "r.html"),
+                "concentrations": {label: 100},
+            }
+        )
+    )
+    payload = json.loads(result["content"][0]["text"])
+    assert payload["concentrations_supplied"] == [label]
+    assert payload["concentrations_missing"] == []
 
 
 # --------------------------------------------------------------------------- #
@@ -484,6 +616,29 @@ def test_gate_stops_an_export_and_tells_the_model_not_to_retry(tmp_path):
     assert decision.behavior == "deny" and DECLINED in decision.message
     assert str(tmp_path / "out.gb") in asked[0]  # the resolved path, not the bare argument
     assert "prod_1" in asked[0]
+
+
+def test_gate_stops_a_report_the_model_asked_for(tmp_path):
+    """The report is the real enforcement point now: it is what the model reaches for."""
+    pytest.importorskip("claude_agent_sdk")
+    from bbl.llm.agent import DECLINED, confirmation_gate
+
+    asked = []
+    gate = confirmation_gate(lambda q: asked.append(q) or False, tmp_path)
+    args = {"product_id": "prod_1", "path": "r.html"}
+    decision = _gate_decision(gate, "mcp__bbl__generate_report", args)
+    assert decision.behavior == "deny" and DECLINED in decision.message
+    assert str(tmp_path / "r.html") in asked[0]
+
+
+def test_gate_does_not_stand_between_the_model_and_report_inputs(tmp_path):
+    """Asking which concentrations are needed writes nothing, so it must not stop to confirm."""
+    pytest.importorskip("claude_agent_sdk")
+    from bbl.llm.agent import confirmation_gate
+
+    gate = confirmation_gate(lambda q: False, tmp_path)
+    decision = _gate_decision(gate, "mcp__bbl__report_inputs", {"product_id": "prod_1"})
+    assert decision.behavior == "allow"
 
 
 def test_gate_lets_a_confirmed_export_through(tmp_path):
