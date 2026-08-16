@@ -13,15 +13,25 @@ dependencies = [
     # fails on this cluster. 0.0.18 ships a cp312 manylinux wheel. See docs/DECISIONS.md D3.
     "pydivsufsort==0.0.18",
     "pydna>=5.5",
+    "pydantic>=2",
+    # Plasmid maps. Required, not optional: a report whose figures depend on how the reader
+    # installed bbl is not a report you can rely on receiving (docs/DECISIONS.md D83). Both
+    # are imported lazily, so `import bbl` still does not pull in a plotting stack. On this
+    # cluster install with `--only-binary=:all:` -- glibc is 2.17, so pip must not fall back
+    # to building Pillow and matplotlib from source against manylinux_2_28 sdists.
+    "dna_features_viewer>=3.1",
+    "matplotlib>=3.7",
 ]
 
 [project.optional-dependencies]
+# The agent transport is optional: `import bbl` and every domain test work without it, and
+# bbl.llm.auth.check_agent_cli() turns a missing install into an actionable error rather than
+# an ImportError. The SDK also needs the `claude` CLI on PATH -- it runs it as a subprocess.
+claude = ["claude-agent-sdk>=0.2.116"]
 test = ["pytest>=7"]
-# Plasmid maps in cloning reports. Optional so that `import bbl` never needs a plotting
-# stack; bbl.report says what to install when they are missing. On this cluster install with
-# `--only-binary=:all:` -- glibc is 2.17, so pip must not fall back to building Pillow and
-# matplotlib from source against manylinux_2_28 sdists. See docs/DECISIONS.md D77.
-report = ["dna_features_viewer>=3.1", "matplotlib>=3.7"]
+
+[project.scripts]
+bbl = "bbl.cli:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]

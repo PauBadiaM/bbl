@@ -271,13 +271,5 @@ def report(source, pattern: str = "*.dna", min_containment: float = 0.5) -> str:
     return "\n".join(lines)
 
 
-if __name__ == "__main__":  # pragma: no cover
-    import os
-    import sys
-
-    target = sys.argv[1] if len(sys.argv) > 1 else os.environ.get("BBL_PLASMID_DIR", "plasmid")
-    print(report(target))
-
-
 #: Backwards-friendly short alias.
 scan = scan_inventory

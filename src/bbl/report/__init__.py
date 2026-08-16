@@ -7,8 +7,8 @@
                  aim="A sensor control with the NF-kB response element removed.")
 
 The report is what a plan looks like once it has to survive contact with a pipette: reaction
-volumes, gel percentages, what to write down afterwards. Plasmid figures need the optional
-extras (``pip install "bbl[report]"``); without them the report still builds, and says so.
+volumes, gel percentages, what to write down afterwards. It is one self-contained HTML file --
+figures inline, nothing fetched from the network.
 """
 
 from __future__ import annotations
@@ -17,20 +17,18 @@ from pathlib import Path
 
 from .bench import BENCH_DEFAULTS, Component, Table, bench_config
 from .build import DesignReport, Figure, Step, build_report
-from .maps import MissingFigureDependency, circular_svg, figures_available, linear_svg
+from .maps import circular_svg, linear_svg
 
 __all__ = [
     "BENCH_DEFAULTS",
     "Component",
     "DesignReport",
     "Figure",
-    "MissingFigureDependency",
     "Step",
     "Table",
     "bench_config",
     "build_report",
     "circular_svg",
-    "figures_available",
     "linear_svg",
     "write_report",
 ]

@@ -108,8 +108,9 @@ is biologically wrong.
 The library is keyed by **sequence**, not by filename or feature label — both are unreliable
 here (one file is named `...Tornado...` but annotates the part as `5'/3' ribozyme`).
 
-```bash
-python -m bbl.inventory /path/to/plasmid     # duplicates + lineage report
+```python
+from bbl.inventory import report
+print(report("/path/to/plasmid"))            # duplicates + lineage
 ```
 
 On the current 28-plasmid library: 28 distinct sequences, no duplicates. The strongest
@@ -183,68 +184,85 @@ section per bench step with its reagent table, then fields to fill in as you go.
 Lab-specific kit names, buffer volumes and molar excesses live under the `bench` key of
 `config/lab.json`; the defaults are seeded from the eCLM24 entry in `plasmid/`.
 
-Maps need the optional extras — on this cluster, wheels only:
-
-```bash
-pip install --only-binary=:all: -e ".[report]"
-```
-
-Without them the report still builds, minus the figures, and says what to install.
-
-`examples/` holds one generated report per route — open
-`examples/sensor_control_report.html` in a browser to see the output. Regenerate with
-`python examples/make_reports.py`; that script drives the same `DesignSession` the model-facing
-tools call, so it runs without an API key.
+In a design session this is what `/report N [path]` writes, and what the agent calls
+`generate_report` to produce — the report is how a session ends, not a separate exercise.
 
 ## Interactive design sessions
 
 ```bash
-ant auth login                             # short-lived session token (preferred)
-python -m bbl.llm                          # asks where your plasmids are
-python -m bbl.llm --plasmids ~/constructs  # a directory, anywhere
-python -m bbl.llm --plasmids a.dna b.dna   # specific files
+bbl                              # asks where your plasmids are
+bbl --plasmids ~/constructs      # a directory, anywhere
+bbl --plasmids a.dna b.dna       # specific files
+bbl --resume                     # pick up the last design in this directory
 ```
 
-Credentials: an **active Claude session** first (`ANTHROPIC_AUTH_TOKEN`, or a token minted from
-your `ant auth login` profile), an **API key** as fallback, and otherwise an offer to log in.
-The session deliberately outranks the key so a stale exported key can't silently shadow it —
-and the startup line prints which source was used. Session tokens are re-minted automatically
-if they expire mid-conversation.
+One command, one agent. It opens by asking what you are trying to build, works the route
+against your library, and ends with a protocol for getting there.
 
 ```
-› I need a control for my sensor: pcDNA3.1, miniCMV-mCherry-LambdaBoxBx8-polyA, AmpR.
-  → search_inventory(query=NFKBRE)
-  → plan_deletion(plasmid=pHL391, features=['NFKBRE'])
-  → compare_product(product_id=prod_1, target=pCLM1)
+auth: Claude subscription (session)
+bbl -- 28 plasmids from ~/constructs
 
-  [recommendation, then the verified protocol appended verbatim]
+  What are you trying to build? To design the route I need the backbone, the parts that must
+  be present, the selection marker, and the host.
 
-› export prod_1 as pCLM1_designed.gb
-  ⚠ write 5704 bp to pCLM1_designed.gb [y/N]
+› pHL391 with NFKBRE removed. Nothing else should change.
+  → inspect_plasmid: pHL391
+  ✓ 3751 chars
+  → plan_deletion: pHL391
+  ✓ 657 chars
+  → compare_product: prod_1
+  ● 6 turns · $0.22 · 32.8s
 
-› write me a report for it
-  → report_inputs(product_id=prod_1)
-  I need the pHL391 miniprep concentration to fill in the digest volumes — what did it read?
+  Don't clone this — pCLM1 is already your target. compare_product returned identical: true.
+  [...judgment, then the verified protocol appended verbatim...]
+
+› export prod_1 to designed.gb
+  ⚠ save prod_1 to /home/you/constructs/designed.gb? [y/N]
+
+› write me a report for the bench
+  → report_inputs: prod_1
+  ✓ 182 chars
+  What did the pHL391 miniprep read on the Nanodrop? It fills in the digest volumes.
 
 › 1364 ng/uL
-  → generate_report(product_id=prod_1, path=pCLM1_report.html, concentrations={...})
-  ⚠ write a cloning report to pCLM1_report.html [y/N]
+  → generate_report: prod_1
+  ⚠ save prod_1 to /home/you/constructs/pCLM1_report.html? [y/N] y
+
+  wrote pCLM1_report.html — 7 steps, 4 figures
+    1. Miniprep pHL391
+    2. Double digest MfeI + EcoRI
+    ...
 ```
 
-`/report N [path]` does the same thing without going through the model. A comparison run
-earlier in the session is remembered, so the report's header can state that the design is
-identical to pCLM1 without the model having to carry the verdict back in.
+**Credentials** resolve the way [`acumen`](https://github.com/scverse/acumen) does it: your
+**Claude subscription** first (the OAuth login in `~/.claude/.credentials.json`, or
+`CLAUDE_CODE_OAUTH_TOKEN`), an **API key** as fallback (`ANTHROPIC_API_KEY`,
+`ANTHROPIC_AUTH_TOKEN`, Bedrock, Vertex), and otherwise a loud failure before anything else
+happens. The subscription outranks the key so a stale exported key can't silently shadow the
+plan you already pay for; `--auth session` / `--auth api` force one, and the startup line
+always prints which is live.
 
-Nine tools over the primitives; state persists across turns, so routes can be planned,
-compared and exported by handle. Two properties make it trustworthy rather than plausible:
+`/report N [path]` does the same thing without going through the model, prompting for the same
+concentrations. A comparison run earlier in the session is remembered, so the report's header
+can state that the design is identical to pCLM1 without the model having to carry the verdict
+back in.
+
+Ten tools over the primitives, run in-process against the live session, so state persists
+across turns and routes can be planned, compared, exported and written up by handle. The
+conversation lives in the `claude` CLI and is written to disk by it, which is what `--resume`
+picks back up. Only the tools that write to disk stop to ask — everything read-only runs
+unattended.
+
+Two properties make it trustworthy rather than plausible:
 
 - **No tool ever returns a sequence.** Products are handles (`prod_1`); the model physically
   cannot construct or paraphrase DNA. Enforced by a test that scans every tool result.
 - **The harness renders the protocol, not the model** — enzyme names and bp counts come
   straight from the verified plan.
 
-`session.py` has no Anthropic dependency, so the whole model-facing contract is tested offline
-with no API key.
+`session.py` has no model-SDK dependency, so the whole model-facing contract is tested offline
+with no credentials — including the agent loop, which is driven by a fake message stream.
 
 ## Where plasmids come from
 
@@ -273,9 +291,15 @@ opaque identifiers and no directory in the call path.
 ## Install
 
 ```bash
-pip install -e ".[test]"
+pip install -e ".[claude,test]"
 pytest -q
 ```
+
+The `claude` extra pulls in the Agent SDK, which drives the `claude` CLI as a subprocess.
+Recent SDK wheels bundle that binary, so the extra is usually the whole install; if yours does
+not, put [Claude Code](https://claude.com/claude-code) on `PATH`. Without the extra the library
+still imports and every domain test still runs — only `bbl` itself needs it, and it says so
+rather than failing on an import.
 
 `pydivsufsort` is pinned to `0.0.18`; newer versions are sdist-only and fail to build on this
 cluster. Tests locate the inventory via `BBL_PLASMID_DIR`.
@@ -289,7 +313,8 @@ src/bbl/sourcing.py     insert + backbone sourcing ladders
 src/bbl/complexity.py   synthesisability screen (PLACEHOLDER)
 src/bbl/config.py       lab state: base vectors, enzyme stock, availability
 src/bbl/sources.py      storage abstraction: directory / files / memory / remote
-src/bbl/llm/            LLM interface: session boundary, tools, prompts, REPL
+src/bbl/cli.py          the `bbl` entry point: flags, auth preflight
+src/bbl/llm/            the agent: auth, session boundary, tools, prompts, REPL, rendering
 src/bbl/report/         bench-ready reports: maps.py figures, bench.py reagent maths,
                         fastdigest.py supplier conditions, build.py plan -> notebook entry,
                         html.py single-file output
@@ -304,7 +329,7 @@ tests/test_pcr.py       primer design on the site-free pHL391 variant
 tests/test_insert.py    pCLM3 + BoxB -> pCLM2 regression
 tests/test_inventory.py fingerprint invariants, dedup, lineage recovery
 tests/test_sourcing.py  both ladders, provenance, complexity placeholder
-tests/test_llm.py       tool contract, gates, protocol appending (offline)
+tests/test_llm.py       tool contract, gates, auth, protocol appending (offline)
 tests/test_bench.py     reagent maths against the lab's own notebook spreadsheet
 tests/test_report.py    figure pruning, route coverage, nothing-invented invariants
 tests/test_sources.py   storage independence, incl. a synthetic Benchling store

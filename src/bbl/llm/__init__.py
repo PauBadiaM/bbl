@@ -1,19 +1,12 @@
-"""LLM interface: tool wrappers, structured schemas, and the design loop.
+"""LLM interface: the design tools, structured schemas, and the interactive session.
 
-``session`` and ``schemas`` import cleanly without the Anthropic SDK, so the whole boundary is
-testable offline. ``tools`` needs it.
+``session``, ``schemas`` and ``prompts`` import cleanly without ``claude-agent-sdk``, so the
+whole model-facing contract is testable offline. ``tools``, ``agent`` and ``chat`` need it.
 """
 
-from .prompts import SYSTEM, build_system_blocks, inventory_digest
+from .prompts import SYSTEM, build_system_blocks, build_system_prompt, inventory_digest
 from .schemas import PartMatch, PartResolution, Spec
 from .session import DesignSession, Product
-
-
-def chat(*args, **kwargs):
-    """Start an interactive design session (lazy import: needs the Anthropic SDK)."""
-    from .chat import run
-
-    return run(*args, **kwargs)
 
 __all__ = [
     "DesignSession",
@@ -23,6 +16,6 @@ __all__ = [
     "SYSTEM",
     "Spec",
     "build_system_blocks",
-    "chat",
+    "build_system_prompt",
     "inventory_digest",
 ]

@@ -55,6 +55,9 @@ class DesignSession:
     library: object
     entries: list[InventoryEntry] = field(default_factory=list)
     products: dict[str, Product] = field(default_factory=dict)
+    #: Every report written this session, in order. Read by the harness to print what landed
+    #: on disk; never read by the model.
+    reports: list[dict] = field(default_factory=list)
     config: dict = field(default_factory=load_lab_config)
     #: Called before any outward-facing action. Return False to decline. None = auto-approve.
     confirm: object = None
@@ -346,6 +349,29 @@ class DesignSession:
             "features": len(product.record.features),
         }
 
+    def save_protocol(self, product_id: str, path: str) -> dict:
+        """Write a product's bench protocol to a text file. Outward-facing.
+
+        The model cannot do this with a generic write tool: the protocol is rendered by the
+        harness *after* its message, so the model never has the text in hand (D64). This is the
+        tool that lets it honour "save the protocol" without ever composing the protocol.
+
+        This is the plain-text path. :meth:`generate_report` is the other one, and writes the
+        bench document -- volumes, gels, maps -- rather than the protocol alone.
+        """
+        if product_id not in self.products:
+            return {"error": f"unknown product {product_id!r}"}
+        protocol = self.protocol_for(product_id)
+        if self.confirm is not None and not self.confirm(f"write the protocol to {path}"):
+            return {
+                "declined": True,
+                "note": "the user declined; do not retry, ask what they want instead",
+            }
+        target = Path(path)
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text(protocol, encoding="utf-8")
+        return {"product_id": product_id, "path": str(target), "lines": protocol.count("\n") + 1}
+
     def dna_needing_concentration(self, product_id: str) -> list[dict]:
         """Which stocks the report's volumes depend on, so the user can be asked for them.
 
@@ -385,8 +411,11 @@ class DesignSession:
         ``aim`` is the user's sentence about why the construct exists; ``concentrations`` maps
         a plasmid name to ng/uL and fills in the reaction volumes. Anything not supplied stays
         an input box in the report rather than a guess.
+
+        The counterpart to :meth:`save_protocol`: that one writes the protocol text, this one
+        writes the document you take to the bench.
         """
-        from ..report import build_report, figures_available
+        from ..report import build_report
 
         if product_id not in self.products:
             return {"error": f"unknown product {product_id!r}"}
@@ -397,7 +426,9 @@ class DesignSession:
                 "note": "the user declined; do not retry, ask what they want instead",
             }
 
+        supplied = _numeric(concentrations)
         written = Path(path)
+        written.parent.mkdir(parents=True, exist_ok=True)
         parent_name = self._label_for(product.parent) if product.parent is not None else None
         donor_name = self._label_for(product.donor) if product.donor is not None else None
         report = build_report(
@@ -409,24 +440,28 @@ class DesignSession:
             name=name,
             parent_name=parent_name,
             donor_name=donor_name,
-            concentrations=_numeric(concentrations),
+            concentrations=supplied,
             config=self.config,
             verified_against=product.comparisons[-1] if product.comparisons else None,
         )
         written.write_text(report.to_html())
-        return {
+        result = {
             "product_id": product_id,
             "path": str(written),
             "sections": len(report.steps),
             "figures": len(report.figures),
-            "maps_included": figures_available(),
-            "concentrations_supplied": sorted(_numeric(concentrations)),
+            "concentrations_supplied": sorted(supplied),
             "concentrations_missing": [
                 item["plasmid"]
                 for item in self.dna_needing_concentration(product_id)
-                if item["plasmid"] not in _numeric(concentrations)
+                if item["plasmid"] not in supplied
             ],
         }
+        # Kept so the harness can say what landed on disk without the model narrating it --
+        # the same split as the protocol (D64). The step titles come along because the
+        # terminal digest is built from them.
+        self.reports.append({**result, "steps": [step.title for step in report.steps]})
+        return result
 
 
 def _numeric(concentrations) -> dict:

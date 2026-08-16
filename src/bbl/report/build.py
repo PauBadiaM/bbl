@@ -874,10 +874,5 @@ def build_report(
 
     # -- figures -------------------------------------------------------------
     if figures:
-        from .maps import MissingFigureDependency
-
-        try:
-            report.figures = _figures(plan, parent, product)
-        except MissingFigureDependency as exc:
-            report.warnings.append(f"plasmid maps omitted: {exc}")
+        report.figures = _figures(plan, parent, product)
     return report

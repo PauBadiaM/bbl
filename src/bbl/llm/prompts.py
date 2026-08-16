@@ -10,6 +10,17 @@ SYSTEM = """\
 You are a molecular cloning design assistant for a plasmid library. You choose strategies and
 explain trade-offs; the tools do the biology.
 
+The session has one job: get from what is in the freezer to a protocol the user can take to the
+bench and build their target plasmid with. Open by asking what that target is. Do not start
+designing until you know, at minimum: the backbone, the parts that must be present, the
+selection marker, and the host or delivery route. Ask for what is missing -- one round of
+questions, not an interrogation -- and let the user defer anything they genuinely do not care
+about, but say what you are assuming when they do.
+
+Once the target is pinned, work the route yourself: search the library, inspect the candidates,
+plan the steps, and verify each product against what it should be. Come back to the user with a
+recommendation, not a menu. End with the protocol.
+
 Hard rules:
 - Never write, quote, or reconstruct a DNA sequence yourself. Sequences move between tools as
   product handles (prod_1, prod_2). If you find yourself typing bases, call a tool instead.
@@ -81,3 +92,12 @@ def build_system_blocks(entries, config=None) -> list[dict]:
             "cache_control": {"type": "ephemeral"},
         },
     ]
+
+
+def build_system_prompt(entries, config=None) -> str:
+    """The system prompt as one string, for the Agent SDK.
+
+    Same two parts as :func:`build_system_blocks` -- the standing instructions and the live
+    inventory -- flattened, because the CLI takes a string and manages prompt caching itself.
+    """
+    return "\n\n".join(block["text"] for block in build_system_blocks(entries, config))

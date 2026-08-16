@@ -19,7 +19,7 @@ from bbl import (
     plan_insertion,
 )
 from bbl.plasmid_io import feature_label, feature_span
-from bbl.report import build_report, figures_available, write_report
+from bbl.report import build_report, write_report
 from bbl.report.bench import BLANK
 from bbl.report.maps import prune_features
 
@@ -96,7 +96,6 @@ def test_pruning_never_keeps_a_primer_binding(parent):
     assert all(f.type != "primer_bind" for f in kept)
 
 
-@pytest.mark.skipif(not figures_available(), reason="matplotlib/dna_features_viewer not installed")
 def test_figures_are_inline_svg_with_unique_internal_ids(excision, parent, tmp_path):
     """Four figures share one document, so a clip path in one must not capture another."""
     html = write_report(excision, tmp_path / "r.html", parent=parent).read_text()
@@ -117,18 +116,11 @@ def test_figures_are_inline_svg_with_unique_internal_ids(excision, parent, tmp_p
     assert "<?xml" not in html  # a prolog inside <body> is not legal
 
 
-def test_a_report_still_builds_without_the_plotting_extras(excision, parent, monkeypatch):
-    """The extras are optional, so their absence must degrade rather than crash."""
-    import bbl.report.maps as maps
-
-    def missing():
-        raise maps.MissingFigureDependency("no matplotlib here")
-
-    monkeypatch.setattr(maps, "_plotting", missing)
-    report = build_report(excision, parent=parent)
+def test_a_report_can_be_built_without_figures(excision, parent):
+    """``figures=False`` is the only way to skip them now -- the procedure is unaffected."""
+    report = build_report(excision, parent=parent, figures=False)
     assert report.figures == []
-    assert any("maps omitted" in warning for warning in report.warnings)
-    assert report.steps  # the procedure is unaffected
+    assert report.steps
 
 
 # --------------------------------------------------------------------------- #

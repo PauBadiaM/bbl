@@ -11,9 +11,9 @@ clean feature list: it carries primer bindings, umbrella annotations spanning ha
 inside ``NFKBRE``, eight monomers inside ``Lambda BoxB x8``). Drawn literally, the labels bury
 the figure. :func:`prune_features` is the editorial pass -- see ``docs/DECISIONS.md``.
 
-``matplotlib`` and ``dna_features_viewer`` are optional extras -- ``import bbl`` must keep
-working without them -- so both are imported lazily and their absence raises a message saying
-what to install.
+``matplotlib`` and ``dna_features_viewer`` are required dependencies (D83), but still imported
+lazily: ``matplotlib.use("Agg")`` has to precede ``pyplot`` on a headless node, and keeping the
+plotting stack off the ``import bbl`` path keeps the domain primitives cheap to import.
 
 Figures come back as inline-ready SVG strings rather than files: a report is one
 self-contained HTML document, so there is nothing to keep together and nothing to lose.
@@ -54,33 +54,20 @@ MARK_COLOR = "#c0392b"
 _TEXT = "#333333"
 
 
-class MissingFigureDependency(RuntimeError):
-    """Raised when the plotting extras are not installed."""
-
-
 def _plotting():
-    """Import the optional plotting stack, or explain how to get it."""
-    try:
-        import matplotlib
+    """Import the plotting stack. Lazy for two reasons, both still load-bearing (D83).
 
-        matplotlib.use("Agg")  # no display on a cluster node; must precede pyplot
-        import matplotlib.pyplot as plt
-        from dna_features_viewer import BiopythonTranslator, CircularGraphicRecord
-    except ImportError as exc:  # pragma: no cover - covered by the skip in the tests
-        raise MissingFigureDependency(
-            "plasmid figures need matplotlib and dna_features_viewer: "
-            'pip install --only-binary=:all: "bbl[report]"'
-        ) from exc
+    ``matplotlib.use("Agg")`` must run before ``pyplot`` is imported -- there is no display on
+    a cluster node -- and deferring the import keeps matplotlib off the ``import bbl`` path,
+    so the domain primitives stay cheap to import.
+    """
+    import matplotlib
+
+    matplotlib.use("Agg")  # no display on a cluster node; must precede pyplot
+    import matplotlib.pyplot as plt
+    from dna_features_viewer import BiopythonTranslator, CircularGraphicRecord
+
     return plt, BiopythonTranslator, CircularGraphicRecord
-
-
-def figures_available() -> bool:
-    """True when a report can carry plasmid maps."""
-    try:
-        _plotting()
-    except MissingFigureDependency:
-        return False
-    return True
 
 
 # ---------------------------------------------------------------------------
