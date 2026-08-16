@@ -322,6 +322,26 @@ class DesignSession:
             "features": len(product.record.features),
         }
 
+    def save_protocol(self, product_id: str, path: str) -> dict:
+        """Write a product's bench protocol to a text file. Outward-facing.
+
+        The model cannot do this with a generic write tool: the protocol is rendered by the
+        harness *after* its message, so the model never has the text in hand (D64). This is the
+        tool that lets it honour "save the protocol" without ever composing the protocol.
+        """
+        if product_id not in self.products:
+            return {"error": f"unknown product {product_id!r}"}
+        protocol = self.protocol_for(product_id)
+        if self.confirm is not None and not self.confirm(f"write the protocol to {path}"):
+            return {
+                "declined": True,
+                "note": "the user declined; do not retry, ask what they want instead",
+            }
+        target = Path(path)
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text(protocol, encoding="utf-8")
+        return {"product_id": product_id, "path": str(target), "lines": protocol.count("\n") + 1}
+
 
 def _parse_site(at: str):
     """``"NFKBRE"`` | ``"1491"`` | ``"1491:1512"`` -> the form plan_insertion expects."""

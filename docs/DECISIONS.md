@@ -471,13 +471,30 @@ capability -- `gibson_pcr` would have produced a perfectly good pCLM2 all along.
 
 Interactive design sessions over the existing primitives. `python -m bbl.llm`.
 
-**D62. Tool Runner, not the Claude Agent SDK.** They sound alike and are different packages.
-The **Agent SDK** (`claude-agent-sdk`) is Claude Code as a library — built-in Read/Write/Edit/
-Bash, for filesystem agents. The **Tool Runner** (`client.beta.messages.tool_runner`, in the
-regular `anthropic` SDK) drives the loop over tools *you* define. We want the model calling
-`excise_features`, not editing files, so Tool Runner is the fit. Managed Agents was also
-rejected: it hosts the sandbox on Anthropic's infrastructure, and our tools need the `.dna`
-files and biopython that live on OAK.
+**D62. The Claude Agent SDK, not the Tool Runner.** *Reversed. Originally we chose the Tool
+Runner (`client.beta.messages.tool_runner`, in the regular `anthropic` SDK) on the grounds that
+the Agent SDK is "Claude Code as a library" — built-in Read/Write/Edit/Bash, for filesystem
+agents — whereas we want the model calling `excise_features`, not editing files.*
+
+That reasoning was about tools, and it turned out the deciding constraint was authentication.
+A Claude subscription is an OAuth login the `claude` CLI writes to `~/.claude/.credentials.json`,
+and only the CLI can present it. The `anthropic` SDK cannot, so the Tool Runner path could bill
+one thing: a metered API key. Everything else we had to hand-build on top of it — session-token
+minting through an internal CLI that is not installed on most machines, a `models.list()`
+liveness check on every startup, a manual `messages` list that corrupted itself whenever a turn
+failed partway, no streaming, and no way to serialize a conversation and resume it.
+
+The Agent SDK gives all of that away for free, and the premise of the original entry does not
+actually hold: `create_sdk_mcp_server` runs *our* tools in *our* process, closing over the live
+`DesignSession`, so the model still calls `excise_features` rather than editing files. The
+built-in `Write` is a bonus, allowlisted only for the working directory. Managed Agents stays
+rejected for the original reason: it hosts the sandbox on Anthropic's infrastructure, and our
+tools need the `.dna` files and biopython that live on OAK.
+
+D63–D70 are unaffected. They constrain `session.py`, which is below the transport and did not
+change: no tool returns a sequence, the harness renders the protocol, refusals are results, and
+the whole model-facing contract is testable with no SDK and no network. Auth resolution is
+ported from `scverse/acumen` (`src/acumen/env.py`); see `src/bbl/llm/auth.py`.
 
 **D63. Handles, not payloads — the invariant made structural.** No tool returns a sequence.
 Products live in a session-side registry keyed by `prod_1`, and the model passes handles. This
@@ -488,9 +505,10 @@ tool result for runs of 40+ ACGT.
 
 **D64. The harness renders the protocol, not the model.** `.protocol` already contains exact
 enzyme names, bp counts and junctions. A paraphrase could turn MfeI into MunI or 6234 into
-6324 — errors no reader would catch. The model writes the judgment; `design()` appends the
-protocol verbatim for any product created during that turn, and the system prompt tells the
-model not to restate it.
+6324 — errors no reader would catch. The model writes the judgment; `agent.new_protocols()`
+appends the protocol verbatim for any product created during that turn *and named in the reply*,
+and the system prompt tells the model not to restate it. Deliberately transport-independent:
+it takes a session, a before-set and the reply text, so it survived the D62 reversal untouched.
 
 **D65. Refusals are successful tool results.** `{"feasible": false, "reasons": {...}}`, never
 `is_error`. Marking a domain refusal as an error makes the model retry the identical call.
@@ -573,7 +591,35 @@ removes.
 
 ---
 
-# D76. Active Claude session first, API key as fallback, otherwise offer to log in
+# D76. Subscription first, API key as fallback, otherwise a loud failure
+
+*Rewritten with D62. The original scheme below is kept for the reasoning that survived it.*
+
+Precedence, first match wins, ported from `scverse/acumen` (`src/acumen/env.py`) into
+`src/bbl/llm/auth.py`:
+
+1. **Claude subscription** -- `CLAUDE_CODE_OAUTH_TOKEN` if exported, else the `claudeAiOauth`
+   object in `~/.claude/.credentials.json` (honouring `$CLAUDE_CONFIG_DIR`). It is the presence
+   of that *object* that distinguishes a subscription from a bare API-key setup; the file
+   merely existing does not.
+2. **API key** -- `ANTHROPIC_API_KEY`, `ANTHROPIC_AUTH_TOKEN`, or a Bedrock/Vertex routing flag.
+3. **Fail** -- before the library scan and the banner, with the fix in the message.
+
+`--auth session` / `--auth api` force one and fail if it is not reachable, so the choice is
+never silent. There is no interactive login: `claude` owns that flow and does it better.
+
+**The unused credential is blanked, not dropped. ↺** The SDK builds the CLI subprocess
+environment as `{**os.environ, **options.env}` -- it merges our mapping *over* the inherited
+one. A credential we merely omit from the dict falls through from `os.environ` unchanged and
+the session silently bills the wrong thing. `agent_env()` sets the other mode's variables to
+`""`, which the CLI reads as unset. This is the single most copy-worthy line in acumen.
+
+**What the original scheme got right, and kept:** the subscription outranks the key (below),
+and the startup line prints which is live. What it got wrong was reachability -- see D62.
+
+---
+
+## Superseded: the `ant auth` scheme
 
 Precedence, first match wins:
 
@@ -612,3 +658,79 @@ failing means something else is wrong, and retrying would hide it.
 inherited, adding `--no-browser` when there is no display -- the usual case over SSH on a
 cluster, where it prints a URL to open elsewhere and takes the code back in the terminal. If
 the CLI is missing, the error says how to install it.
+
+
+---
+
+# D77. Three things the Agent SDK does not do the way the docs suggest
+
+Found by testing, not by reading. Each is a place where the obvious configuration silently
+does nothing, which is worse than an error.
+
+**Path-scoped tool rules are ignored in `allowed_tools`. ↺** The natural way to let the agent
+write only inside the working directory is `allowed_tools=["Write(//abs/path/**)"]` -- the form
+acumen uses. Measured against CLI 2.1.x / SDK 0.2.139, that entry has no effect: the write
+still falls through to `can_use_tool`, and so does every other spelling tried
+(`Write(/abs/path/**)`, `Write(./**)`). Only a whole-tool pattern such as `Write(*)` takes
+effect there -- and that one allows writing *anywhere*, which is the opposite of the intent.
+Path scoping does work in a settings file's `permissions.allow`, which is how acumen gets it.
+bbl leaves `Write` off the allowlist entirely and enforces the scope in `confirmation_gate()`
+as a `Path.is_relative_to` check: no temp settings file, and the rule is testable in-process.
+
+**An allowlisted tool is never gated.** An `allowed_tools` entry auto-approves before
+`can_use_tool` is consulted -- the SDK warns about this, and the warning is worth heeding. It
+means `export_product` must be left *off* the allowlist or the D69 confirmation is dead code
+that looks alive. Tested directly: `test_an_outward_facing_tool_is_never_allowlisted`.
+
+**The CLI is usually bundled, so do not gate on `PATH`. ↺** The first version of
+`check_agent_cli()` required `shutil.which("claude")`, reasoning that the SDK shells out to it.
+It does -- but `_find_cli()` looks for a 324 MB binary shipped *inside the wheel* first and only
+then falls back to `PATH`. The check would have rejected a plain `pip install 'bbl[claude]'`,
+which works fine; verified by running a full session with `PATH=/usr/bin:/bin`.
+`claude_cli_found()` now mirrors the SDK's own resolution order.
+
+**`setting_sources=[]` does not exclude MCP servers. ↺** It covers settings and memories, but
+the CLI still loads MCP servers from project, user and plugin config. Observed symptom: the
+agent noticed the operator's unauthorized claude.ai connectors and spent a paragraph
+explaining how to authorize them, mid-cloning-design. `strict_mcp_config=True` is the separate
+switch that limits it to the servers we pass.
+
+# D78. Ctrl-C aborts the turn, not the session
+
+A design turn runs for minutes. Interrupting it must cost the turn, not the conversation.
+
+**`except KeyboardInterrupt` around an `await` does not work. ↺** Python's default SIGINT
+raises `KeyboardInterrupt` in the main thread; inside `asyncio.run` that surfaces at the await
+point as `CancelledError`, which is a `BaseException` and matches neither the
+`except KeyboardInterrupt` nor the `except Exception` written for it. The process died with
+exit 130 and the conversation was lost. `_interruptible_turn()` installs a loop-level SIGINT
+handler for the duration of the turn that cancels the task instead, and removes it afterwards
+so Ctrl-C at an idle prompt still exits.
+
+**Surviving the signal is not enough -- the agent process dies too.** The SDK spawns the
+`claude` CLI in our own process group, so a terminal Ctrl-C reaches it as well. bbl would then
+sit at a prompt looking healthy and fail the next turn with `CLIConnectionError`. So an
+interrupt (and any lost connection) reconnects and resumes: the conversation lives on disk in
+the CLI's own transcript, and `Renderer` captures the session id from *every* message rather
+than only from the result, so a turn interrupted before it finished is still resumable.
+
+
+# D79. `save_protocol`, because D64 leaves the model unable to hand over the file
+
+D64 has the harness render the protocol *after* the model's message, which is what keeps enzyme
+names and bp counts exact. The cost only shows up when a user says "save the protocol as
+protocol.md": the model has never seen that text and cannot put it on disk. Observed live -- it
+answered "I'll save it in my next message once it's generated", which never comes, because the
+protocol is appended below every message and never enters the conversation.
+
+`save_protocol(product_id, path)` writes `protocol_for(handle)` straight from the plan. The
+model chooses *which* product and *where*, and still never composes a line of it, so D64 holds
+and the deliverable is actually deliverable. Outward-facing, so it goes through the same gate
+as `export_product`.
+
+**The handle-must-be-named filter was too strict. ↺** `new_protocols()` only rendered a
+protocol if the model literally typed `prod_1` in its reply. A genuinely good answer described
+the whole route in terms of plasmids and enzymes without ever typing the handle -- and the
+protocol silently vanished from exactly the turn that had earned it. Now: the named ones if the
+model named any (so planning three routes and recommending one still renders only the
+recommendation), otherwise everything created during the turn.

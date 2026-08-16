@@ -216,3 +216,6 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# bbl session state: the id of the last design conversation in a directory
+.bbl/

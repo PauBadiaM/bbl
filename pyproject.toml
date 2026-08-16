@@ -13,10 +13,18 @@ dependencies = [
     # fails on this cluster. 0.0.18 ships a cp312 manylinux wheel. See docs/DECISIONS.md D3.
     "pydivsufsort==0.0.18",
     "pydna>=5.5",
+    "pydantic>=2",
 ]
 
 [project.optional-dependencies]
+# The agent transport is optional: `import bbl` and every domain test work without it, and
+# bbl.llm.auth.check_agent_cli() turns a missing install into an actionable error rather than
+# an ImportError. The SDK also needs the `claude` CLI on PATH -- it runs it as a subprocess.
+claude = ["claude-agent-sdk>=0.2.116"]
 test = ["pytest>=7"]
+
+[project.scripts]
+bbl = "bbl.cli:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]
