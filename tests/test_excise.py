@@ -168,3 +168,73 @@ def test_every_inventory_plasmid_loads(plasmid_dir):
         record = load_plasmid(path)
         assert len(record) > 1000, path.name
         assert record.circular
+
+
+# --------------------------------------------------------------------------- #
+# readout-handle survival
+# --------------------------------------------------------------------------- #
+
+
+def test_readout_handles_are_checked_without_being_asked(plasmid_dir):
+    """Losing a sequencing handle is invisible until sequencing comes back unreadable.
+
+    The plasmid still propagates and still sequences clean -- it is just no longer readable at
+    that end. ``protect`` catches this only if the caller remembers to name the handle, so the
+    check runs unprompted instead.
+    """
+    from bbl.plasmid_io import delete_span
+    from bbl.targets import READOUT_HANDLE_HINTS, handle_warnings
+
+    record = load_plasmid(
+        plasmid_dir
+        / "pHL394_pLV-U6rev-Tornado-TruseqR2-oFH155-BCS-oFH99-10XCS1-LambdaBoxBx2-EF1-mScarlet.dna"
+    )
+    handles = [
+        f
+        for f in record.features
+        if (label := feature_label(f))
+        and any(hint in label.lower() for hint in READOUT_HANDLE_HINTS)
+    ]
+    assert len(handles) > 3  # precondition: this plasmid is annotated with handles
+
+    # an untouched product must be silent
+    assert handle_warnings(record, record) == []
+
+    truseq = next(
+        f for f in record.features if feature_label(f) == "Illumina Truseq Read 2 Primer"
+    )
+    damaged = delete_span(record, int(truseq.location.start), int(truseq.location.end))
+    warnings = handle_warnings(record, damaged)
+    assert len(warnings) == 1
+    assert "Illumina Truseq Read 2 Primer" in warnings[0]
+
+
+def test_the_hint_list_matches_annotated_labels_not_filenames(plasmid_dir):
+    """Regression on a live bug in the first version of the registry.
+
+    ``pHL394``'s *filename* says ``10XCS1``; its *feature* is labelled ``10X Capture
+    Sequence 1``. A hint of ``"10xcs1"`` therefore matched nothing at all, which is the silent
+    kind of failure -- a registry that looks populated and detects nothing.
+    """
+    from bbl.targets import READOUT_HANDLE_HINTS
+
+    record = load_plasmid(
+        plasmid_dir
+        / "pHL394_pLV-U6rev-Tornado-TruseqR2-oFH155-BCS-oFH99-10XCS1-LambdaBoxBx2-EF1-mScarlet.dna"
+    )
+    labels = {feature_label(f) for f in record.features if feature_label(f)}
+    matched = {
+        label
+        for label in labels
+        if any(hint in label.lower() for hint in READOUT_HANDLE_HINTS)
+    }
+    assert "10X Capture Sequence 1" in matched
+    assert "Illumina Truseq Read 2 Primer" in matched
+    assert "oFH155_HC1F" in matched
+
+
+def test_the_real_deletion_gains_no_spurious_handle_warning(phl391, pclm1):
+    """pHL391 -> pCLM1 touches no readout handle, so the new check must stay quiet."""
+    plan = excise_features(phl391, ["NFKBRE"])
+    assert circular_equal(plan.product, load_plasmid(pclm1))
+    assert not any("readout handle" in warning for warning in plan.warnings)
