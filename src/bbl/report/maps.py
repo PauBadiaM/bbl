@@ -338,6 +338,20 @@ def circular_svg(
         return _fig_to_svg(axes.figure, salt)
 
 
+#: Vertical room one stacked label row needs, in inches. 0.4 is DnaFeaturesViewer's own number
+#: (``finalize_ax``: ``1 + 0.4 * ymax``) -- its label placement was tuned against it, so
+#: borrowing it keeps the two in agreement rather than guessing a second time.
+_LINEAR_INCHES_PER_LEVEL = 0.4
+
+#: Floor, so a two-feature panel does not render as a sliver under a busy one; and a ceiling,
+#: which is a guard against a pathological record rather than a design target. Nothing is
+#: pruned out of a linear zoom to stay under it -- showing the small features *is* the point of
+#: zooming -- so if a real plasmid ever hits the ceiling the answer is a pruning budget like the
+#: circular map's, not a shorter panel.
+_LINEAR_MIN_HEIGHT = 1.8
+_LINEAR_MAX_HEIGHT = 9.0
+
+
 def linear_svg(
     record,
     window,
@@ -353,38 +367,101 @@ def linear_svg(
     ``marks`` are ``(position, label)`` pairs drawn as dashed rules -- the two cut sites on the
     parent, the new junction on the product. Coordinates are in the record's own frame, which
     for a product built by ``replace_span`` is still the parent's frame, so the two panels of a
-    before/after pair line up.
+    before/after pair share a coordinate system (not, note, a scale -- ``zoom_window`` sizes
+    each one to its own span).
+
+    **The height is computed, not chosen.** DnaFeaturesViewer stacks labels that would collide
+    horizontally onto successive levels one data unit apart and sets ``ymax`` to fit them --
+    but it only grows the *physical* figure to match when it created that figure itself
+    (``auto_figure_height = (ax is None) and (figure_height is None)``). Handing it our own
+    axes turned that off. Its other defence, ``ideal_yspan``, is the span at which one line of
+    text measures half a data unit, but ``finalize_ax`` takes ``max(ideal_yspan, natural
+    ymax)`` and the natural ymax grows with the level count while ``ideal_yspan`` is capped by
+    the physical axis height; past about six rows the level count wins, every further row
+    divides the same inch and a half, and the labels overprint. That was the unreadable panel.
+
+    So: plot first, ask the returned ``labels_data`` how tall the stack actually came out, and
+    resize afterwards. A post-pass rather than a computed ``figsize`` because the level count
+    is a *result* of the plot -- and resizing after is safe, since the text is positioned in
+    data coordinates and only the height changes, leaving the width-dependent collision pass
+    that chose those levels still valid.
     """
     plt, translator_base, _ = _plotting()
 
     start, end = max(0, int(window[0])), min(len(record.seq), int(window[1]))
+    span_bp = max(1, end - start)
     translator = _build_translator(
         translator_base, removed=removed, added=added, min_bp=0, protect=protect
     )
     graphic = translator.translate_record(record).crop((start, end))
-    graphic.labels_spacing = 6
+    # The library default, restored from 6. Narrowing the padding was a way of fitting more
+    # labels onto each row of a canvas that could not grow; now that it grows to fit the rows,
+    # the padding can go back to being about legibility.
+    graphic.labels_spacing = 8
 
     with plt.rc_context({"font.size": 9}):
-        figure, axes = plt.subplots(figsize=(width, 1.5))
-        graphic.plot(ax=axes, with_ruler=True, draw_line=True)
+        figure, axes = plt.subplots(figsize=(width, _LINEAR_MIN_HEIGHT))
+        # elevate_outline_annotations lifts every label above every feature. The library
+        # defaults it off, interleaving labels with the arrows to save height -- height we are
+        # no longer short of, and a clean band of text over a clean track of features is what
+        # makes the before/after pair comparable at a glance.
+        _, (levels, labels_data) = graphic.plot(
+            ax=axes,
+            with_ruler=True,
+            draw_line=True,
+            elevate_outline_annotations=True,
+        )
+
+        # Top of the drawn content, in data units. ``levels`` is feature -> level; ``labels_data``
+        # carries the final y of each *stacked* label and correctly omits the inline ones, which
+        # sit inside their feature and cost no row. The + 1 is the headroom the mark labels use.
+        content_top = max(
+            max([1] + list(levels.values())) + 1,
+            max([0] + [d["annotation_y"] for d in labels_data.values()]) + 1,
+        )
+        # Pin ylim to that: on a sparse panel DnaFeaturesViewer may have inflated it to
+        # ideal_yspan, and a band of nothing at the top would make the height formula lie.
+        axes.set_ylim(axes.get_ylim()[0], content_top)
+        figure.set_size_inches(
+            width,
+            min(
+                _LINEAR_MAX_HEIGHT,
+                max(_LINEAR_MIN_HEIGHT, 1 + _LINEAR_INCHES_PER_LEVEL * content_top),
+            ),
+        )
 
         for span, colour in ((removed, REMOVED_COLOR), (added, ADDED_COLOR)):
             if span and span[1] > span[0]:
                 axes.axvspan(span[0], span[1], color=colour, alpha=0.28, zorder=0, lw=0)
-        for position, label in marks:
+
+        # Mark labels ride just above the axes, so the data unit of headroom reserved above the
+        # topmost feature label keeps them clear of it. They can still collide with *each
+        # other*: the two ends of a short deletion are tens of bp apart and each label is
+        # centred on its own rule. Estimate the widths from the character count -- 0.55 em is
+        # close enough for a proportional face at this size -- and drop the second to its own
+        # row rather than overprinting. Measured after the resize, or the conversion from
+        # points to bp is taken against a canvas that no longer exists.
+        axes_points = axes.get_window_extent().width / figure.dpi * 72.0
+        bp_per_point = span_bp / max(1.0, axes_points)
+        row, previous = 0, None
+        for position, label in sorted(marks, key=lambda mark: mark[0]):
             if not start <= position <= end:
                 continue
             axes.axvline(position, color=MARK_COLOR, ls="--", lw=1.1, zorder=3)
+            if previous is not None:
+                crowded = 0.55 * 8.5 * (len(previous[1]) + len(label)) / 2 * bp_per_point
+                row = 1 - row if (position - previous[0]) < crowded else 0
             axes.annotate(
                 label,
                 xy=(position, axes.get_ylim()[1]),
-                xytext=(0, 1),
+                xytext=(0, 1 + row * 11),  # 11 pt: one line of 8.5 pt text with leading
                 textcoords="offset points",
                 ha="center",
                 va="bottom",
                 fontsize=8.5,
                 color=MARK_COLOR,
             )
+            previous = (position, label)
         return _fig_to_svg(figure, salt)
 
 

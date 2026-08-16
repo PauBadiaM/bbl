@@ -130,6 +130,11 @@ table.reaction .vol.pending { color: var(--muted); }
 table.reaction tr.total td { font-weight: 600; }
 table.reaction tbody tr:last-child td { font-weight: 600; }
 table.worksheet tbody tr:last-child td { font-weight: 400; }
+/* The dilution table has two bodies -- the reading, then the steps -- so the generic
+   last-child rule would bold the wrong rows. Only the step you pipette into the PCR is bold. */
+table.dilution tbody tr td { font-weight: 400; font-variant-numeric: tabular-nums; }
+table.dilution tr.final td { font-weight: 600; }
+table.dilution input.stock { width: 7rem; }
 .note-inline { color: var(--muted); font-size: .78rem; }
 .hint { font-size: .78rem; color: var(--accent); margin: -.1rem 0 .5rem; }
 .overflow { color: #b3261e; font-weight: 600; }
@@ -181,6 +186,62 @@ SCRIPT = """
     table.addEventListener('input', function () { render(table); });
     render(table);
   });
+  // Mirror of bbl.report.bench.dilution_plan. Kept in the same shape on purpose: a test runs
+  // this copy and the Python one over the same spec and compares, so the two cannot drift.
+  function dilutionPlan(stock, spec) {
+    var target = spec.target, ladder = spec.ladder, minPipette = spec.minPipette;
+    if (!(stock > 0) || !(target > 0)) return {status: 'unknown', steps: []};
+    if (stock <= target) return {status: 'neat', steps: []};
+    function single(source) {
+      for (var i = 0; i < ladder.length; i++) {
+        var take = target * ladder[i] / source;
+        if (take >= minPipette) return [ladder[i], take];
+      }
+      return null;
+    }
+    var steps = [], source = stock;
+    while (single(source) === null && steps.length < 3) {
+      var final0 = minPipette * 100;
+      steps.push({source: steps.length ? 'step ' + steps.length : 'stock',
+                  take_ul: minPipette, water_ul: final0 - minPipette,
+                  final_ul: final0, gives: source / 100});
+      source = source / 100;
+    }
+    var chosen = single(source);
+    if (chosen === null) return {status: 'unknown', steps: []};
+    steps.push({source: steps.length ? 'step ' + steps.length : 'stock',
+                take_ul: chosen[1], water_ul: chosen[0] - chosen[1],
+                final_ul: chosen[0], gives: target});
+    return {status: 'ok', steps: steps};
+  }
+  function dilutionRows(plan, target) {
+    if (plan.status !== 'ok') {
+      var text = (plan.status === 'neat')
+        ? 'Already at or below ' + target + ' ng/\\u00b5L \\u2014 use it neat.'
+        : 'Measure the stock and type it in \\u2014 the steps to reach ' + target
+          + ' ng/\\u00b5L appear here.';
+      return '<tr><td colspan="4" class="note-inline">' + text + '</td></tr>';
+    }
+    return plan.steps.map(function (step, i) {
+      var last = i === plan.steps.length - 1;
+      return '<tr' + (last ? ' class="final"' : '') + '><td>' + (i + 1) + '. from '
+        + step.source + '</td><td>' + step.take_ul.toFixed(2) + '</td><td>'
+        + step.water_ul.toFixed(2) + '</td><td>' + step.final_ul.toFixed(2)
+        + ' \\u00b5L at ' + step.gives.toFixed(2) + ' ng/\\u00b5L'
+        + (last ? ' \\u2014 this is the template' : '') + '</td></tr>';
+    }).join('');
+  }
+  document.querySelectorAll('table.dilution').forEach(function (table) {
+    var spec = JSON.parse(table.getAttribute('data-dilution'));
+    function render() {
+      var input = table.querySelector('input.stock');
+      var stock = input ? parseFloat(input.value) : NaN;
+      table.querySelector('tbody.steps').innerHTML =
+        dilutionRows(dilutionPlan(stock, spec), spec.target);
+    }
+    table.addEventListener('input', render);
+    render();
+  });
   document.querySelectorAll('button.addrow').forEach(function (button) {
     button.addEventListener('click', function () {
       var body = button.previousElementSibling.querySelector('tbody');
@@ -208,10 +269,12 @@ def _cell(value) -> str:
 
 
 def _table(table) -> str:
-    from .bench import Reaction
+    from .bench import Dilution, Reaction
 
     if isinstance(table, Reaction):
         return _reaction(table)
+    if isinstance(table, Dilution):
+        return _dilution(table)
 
     head = "".join(f"<th>{_escape(column)}</th>" for column in table.columns)
     rows = []
@@ -283,14 +346,69 @@ def _reaction(reaction) -> str:
     )
 
 
+def _dilution(dilution) -> str:
+    """A live dilution: type the stock reading, get a pipetting sequence.
+
+    The body is rewritten in the page whenever the reading changes, so what Python renders here
+    is the same thing the script would render for the same number -- it is what the document
+    says when it is printed, or opened with scripting off.
+    """
+    spec = _html.escape(json.dumps(dilution.spec()), quote=True)
+    value = "" if dilution.ng_per_ul is None else f"{dilution.ng_per_ul:g}"
+    note = f'<p class="note">{_escape(dilution.note)}</p>' if dilution.note else ""
+    return (
+        f'<table class="dilution" data-dilution="{spec}">'
+        f"<caption>{_escape(dilution.title)}</caption><thead><tr>"
+        f"<th>Step</th><th>Take (µL)</th><th>Water (µL)</th><th>Gives</th></tr></thead>"
+        f"<tbody><tr><td>Measured stock</td>"
+        f'<td colspan="3"><input type="number" step="any" min="0" class="stock" '
+        f'value="{value}" placeholder="ng/µL"> ng/µL of {_escape(dilution.template)}'
+        f"</td></tr></tbody>"
+        f'<tbody class="steps">'
+        f"{_dilution_rows(dilution.plan(), dilution.target_ng_per_ul)}</tbody></table>"
+        f'<p class="hint">Type the measured stock concentration — the dilution follows.</p>'
+        f"{note}"
+    )
+
+
+def _dilution_rows(plan, target) -> str:
+    """The step rows of a dilution table. Mirrored by ``dilutionRows`` in :data:`SCRIPT`.
+
+    Two implementations of one formula drift, so a test runs the page's own copy over the same
+    spec and compares -- the same pin the reaction calculator has.
+    """
+    if plan["status"] == "unknown":
+        return (
+            f'<tr><td colspan="4" class="note-inline">Measure the stock and type it in — the '
+            f"steps to reach {target:g} ng/µL appear here.</td></tr>"
+        )
+    if plan["status"] == "neat":
+        return (
+            f'<tr><td colspan="4" class="note-inline">Already at or below {target:g} ng/µL — '
+            "use it neat.</td></tr>"
+        )
+    rows = []
+    for index, step in enumerate(plan["steps"], start=1):
+        last = index == len(plan["steps"])
+        opening = '<tr class="final">' if last else "<tr>"
+        gives = f"{step['final_ul']:.2f} µL at {step['gives']:.2f} ng/µL"
+        tail = " — this is the template" if last else ""
+        rows.append(
+            f"{opening}<td>{index}. from {_escape(step['source'])}</td>"
+            f"<td>{step['take_ul']:.2f}</td><td>{step['water_ul']:.2f}</td>"
+            f"<td>{gives}{tail}</td></tr>"
+        )
+    return "".join(rows)
+
+
 def _ul(value) -> str:
     from .bench import BLANK
 
     return BLANK if value is None else f"{value:.2f}"
 
 
-def _figure(figure, wide=False) -> str:
-    css = "figure wide" if wide else "figure"
+def _figure(figure) -> str:
+    css = "figure wide" if figure.wide else "figure"
     return (
         f'<figure class="{css}">{figure.svg}'
         f"<figcaption>{_escape(figure.caption)}</figcaption></figure>"
@@ -344,12 +462,9 @@ def render_html(report) -> str:
         )
 
     if report.figures:
-        # The builder emits the circular maps first, as a before/after pair, then the linear
-        # zooms; the pair sits in two columns and the zooms run the full width.
-        narrow, wide = report.figures[:2], report.figures[2:]
-        figures = "".join(_figure(f) for f in narrow) + "".join(
-            _figure(f, wide=True) for f in wide
-        )
+        # The circular maps pair up in two columns and the linear zooms run the full width.
+        # Which is which is the figure's own business -- see ``Figure.wide``.
+        figures = "".join(_figure(f) for f in report.figures)
         parts.append(f'<h2>Plasmid maps</h2><div class="figures">{figures}</div>')
 
     if report.materials:

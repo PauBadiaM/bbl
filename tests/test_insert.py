@@ -147,6 +147,27 @@ def test_gibson_and_synthetic_agree(vector, donor, boxb):
 # --------------------------------------------------------------------------- #
 
 
+def test_a_fragment_remembers_the_plasmid_it_came_out_of(vector, donor):
+    """Provenance belongs to the plan, not to whoever happens to call the report builder.
+
+    Both donor routes carry it; the synthetic route leaves it ``None``, which is the same
+    signal ``InsertSource.synthetic`` uses.
+    """
+    record = load_plasmid(donor)
+    for method in ("restriction", "gibson"):
+        plan = plan_insertion(
+            vector, donor, insert_features=["Lambda BoxB x8"], at=SITE, method=method
+        )
+        assert plan.insert.donor_name == record.name
+        assert plan.insert.donor_length == len(record)
+
+
+def test_a_synthetic_fragment_has_no_donor(vector, boxb):
+    plan = plan_insertion(vector, boxb, at=SITE)
+    assert plan.insert.donor_name is None
+    assert plan.insert.donor_length is None
+
+
 def test_synthetic_insert_gets_homology_arms(vector, boxb):
     plan = plan_insertion(vector, boxb, at=SITE, homology=25)
     assert plan.strategy == GIBSON_SYNTHETIC

@@ -143,6 +143,13 @@ class Fragment:
     enzymes: tuple[str, ...] | None = None
     primers: tuple[Primer, Primer] | None = None
     order_sequence: str | None = None  # for a synthesised fragment
+    #: The plasmid this fragment comes out of, when it comes out of one. ``None`` means
+    #: synthetic -- the same signal as :attr:`InsertSource.synthetic`, carried forward so a
+    #: consumer of the plan can say where the DNA came from without having been handed the
+    #: donor record separately. The name is the record's own, which is a 16-character GenBank
+    #: LOCUS; a caller holding the inventory label should prefer that.
+    donor_name: str | None = None
+    donor_length: int | None = None
 
     def __str__(self) -> str:
         return f"{self.role}: {self.name} ({self.length} bp) -- {self.preparation}"
@@ -536,6 +543,8 @@ def plan_insertion(
                         f"{len(fragment)} bp band"
                     ),
                     enzymes=(canonical_name(up_d.enzyme), canonical_name(down_d.enzyme)),
+                    donor_name=source.donor.name,
+                    donor_length=len(source.donor),
                 ),
                 site=(up_v.top, down_v.top),
                 inserted_bp=len(fragment),
@@ -656,6 +665,8 @@ def plan_insertion(
                 "vector end. DpnI-digest the template."
             ),
             primers=(insert_forward, insert_reverse),
+            donor_name=source.donor.name,
+            donor_length=len(source.donor),
         )
         for primer in (insert_forward, insert_reverse):
             warnings.extend(f"{primer.name}: {n}" for n in primer.notes)
