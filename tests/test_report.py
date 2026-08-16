@@ -285,9 +285,11 @@ def test_the_report_is_one_self_contained_file(excision, parent, tmp_path):
     html = path.read_text()
     assert list(tmp_path.iterdir()) == [path]  # no sidecar images
     assert html.startswith("<!doctype html>")
-    # The reaction calculators need script, but nothing may be *fetched*: the report has to
-    # work from a file:// URL on a machine with no network.
-    assert "<img" not in html and "src=" not in html
+    # The reaction calculators need script and the header carries a logo, but nothing may be
+    # *fetched*: the report has to work from a file:// URL on a machine with no network. So the
+    # property is not "no images", it is that every src is inline -- a ``data:`` URI is part of
+    # the document, an http:// or a relative path is a dependency on something outside it.
+    assert all(src.startswith("data:") for src in re.findall(r'src="([^"]*)"', html))
     assert "<link" not in html and "@import" not in html
     assert html.count("<script>") == 1
 

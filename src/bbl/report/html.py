@@ -1,8 +1,8 @@
 """Render a :class:`~bbl.report.build.DesignReport` as one self-contained HTML file.
 
-No JavaScript, no external stylesheet, no image files: the figures are inline SVG, so the
-report is a single artefact that can be emailed, committed, or opened from a cluster share
-years later and still look the same. It prints sensibly too -- a notebook entry gets taped
+No external stylesheet, no image files: the figures are inline SVG and the logo is a base64
+data URI, so the report is a single artefact that can be emailed, committed, or opened from a
+cluster share years later and still look the same. It prints sensibly too -- a notebook entry gets taped
 into a book about as often as it gets read on screen.
 """
 
@@ -14,6 +14,51 @@ import re
 
 #: A sequence-looking string is set in a monospace face and allowed to wrap anywhere.
 _SEQUENCE = re.compile(r"^5?'?-?[ACGT]{8,}-?3?'?$")
+
+#: The BBL mark, 85x96, as a base64 PNG. Inlined rather than shipped alongside the
+#: report so the document stays a single file -- see the module docstring.
+LOGO_DATA_URI = (
+    "data:image/png;base64,"
+    "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"
+)
 
 STYLESHEET = """
 :root {
@@ -27,6 +72,8 @@ body {
 }
 main { max-width: 62rem; margin: 0 auto; }
 h1 { font-size: 1.6rem; margin: 0 0 .2rem; letter-spacing: -.01em; }
+.brand { display: flex; align-items: center; gap: .75rem; }
+.brand img { height: 48px; width: auto; }
 h2 {
   font-size: 1.1rem; margin: 2.6rem 0 .9rem; padding-bottom: .35rem;
   border-bottom: 2px solid var(--ink); text-transform: uppercase; letter-spacing: .06em;
@@ -274,7 +321,8 @@ def render_html(report) -> str:
         for label, value in report.meta
     )
     parts = [
-        f"<h1>{_escape(report.title)}</h1>",
+        f'<header class="brand"><img src="{LOGO_DATA_URI}" alt="BBL">'
+        f"<h1>{_escape(report.title)}</h1></header>",
         f'<p class="subtitle">{_escape(report.subtitle)}</p>',
         f'<div class="meta">{meta}</div>',
     ]
