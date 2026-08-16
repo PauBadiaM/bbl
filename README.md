@@ -140,6 +140,62 @@ library plasmids, so it is moved rather than made and never reaches the gate.
 made with it carries that caveat in its rationale. Lab state (base vectors, enzyme stock,
 unavailable plasmids) lives in `config/lab.json`.
 
+## Cloning reports
+
+A plan says "ligate the vector and the insert". A report says how many microlitres of each.
+
+```python
+from bbl import excise_features, load_plasmid
+from bbl.report import write_report
+
+parent = load_plasmid("plasmid/pHL391_....dna")
+write_report(excise_features(parent, ["NFKBRE"]), "pCLM1_report.html",
+             parent=parent, aim="A promoter-only control for the NF-kB sensor.")
+```
+
+One self-contained HTML file — no sidecar images, nothing fetched from the network — laid out
+like the lab's own notebook entries: aim, cloning strategy, plasmid maps, materials, then one
+section per bench step with its reagent table, then fields to fill in as you go.
+
+- **Plasmid maps** via [DnaFeaturesViewer](https://github.com/Edinburgh-Genome-Foundry/DnaFeaturesViewer):
+  circular parent and product side by side, plus a linear zoom on the edit, because a 66 bp
+  change to a 5.7 kb plasmid is invisible at whole-plasmid scale. Sequence that leaves is red,
+  sequence that arrives is green, cut sites and the new junction are marked. Labels are placed
+  around the circle at their own feature's angle rather than stacked above it.
+- **Live reaction tables.** Type the measured stock concentrations into the digest, Gibson or
+  ligation table and the volumes recompute in the page — the water row turns red if the DNA
+  alone overflows the reaction. No dependencies; it works from a `file://` URL offline.
+- **Enzyme conditions are filled in, from the supplier.** Incubation, thermal inactivation, bp
+  from the end and the star-activity-free window come from a dated scrape of Thermo's
+  FastDigest table (176 enzymes), matched through isoschizomers — the planner says MfeI, the
+  table says MunI. The digest's incubation time and inactivation are derived from it: on
+  pHL391 that catches MfeI being un-heat-killable and EcoRI going star beyond 30 min.
+- **Reagent maths is calculated, not templated.** The molar-ratio arithmetic is checked
+  against a real notebook entry's own spreadsheet to the microlitre (`tests/test_bench.py`).
+- **Nothing is invented.** A volume that depends on a Nanodrop reading nobody has taken shows
+  the requirement it has to satisfy — "100 ng", "15 fmol" — beside an empty box. Pass
+  `concentrations={...}`, or let the agent ask: `report_inputs` says which stocks it needs.
+- **The verified plan is quoted, not regenerated.** `plan.protocol` appears verbatim above the
+  expanded procedure; where the report overrides it, it says so and why.
+- Two numbers move when the product carries a tandem repeat array — outgrowth drops to 30 °C
+  and PCR extension goes to 45 s/kb. The array is detected structurally, not by matching "x8".
+
+Lab-specific kit names, buffer volumes and molar excesses live under the `bench` key of
+`config/lab.json`; the defaults are seeded from the eCLM24 entry in `plasmid/`.
+
+Maps need the optional extras — on this cluster, wheels only:
+
+```bash
+pip install --only-binary=:all: -e ".[report]"
+```
+
+Without them the report still builds, minus the figures, and says what to install.
+
+`examples/` holds one generated report per route — open
+`examples/sensor_control_report.html` in a browser to see the output. Regenerate with
+`python examples/make_reports.py`; that script drives the same `DesignSession` the model-facing
+tools call, so it runs without an API key.
+
 ## Interactive design sessions
 
 ```bash
@@ -165,9 +221,21 @@ if they expire mid-conversation.
 
 › export prod_1 as pCLM1_designed.gb
   ⚠ write 5704 bp to pCLM1_designed.gb [y/N]
+
+› write me a report for it
+  → report_inputs(product_id=prod_1)
+  I need the pHL391 miniprep concentration to fill in the digest volumes — what did it read?
+
+› 1364 ng/uL
+  → generate_report(product_id=prod_1, path=pCLM1_report.html, concentrations={...})
+  ⚠ write a cloning report to pCLM1_report.html [y/N]
 ```
 
-Seven tools over the primitives; state persists across turns, so routes can be planned,
+`/report N [path]` does the same thing without going through the model. A comparison run
+earlier in the session is remembered, so the report's header can state that the design is
+identical to pCLM1 without the model having to carry the verdict back in.
+
+Nine tools over the primitives; state persists across turns, so routes can be planned,
 compared and exported by handle. Two properties make it trustworthy rather than plausible:
 
 - **No tool ever returns a sequence.** Products are handles (`prod_1`); the model physically
@@ -222,6 +290,9 @@ src/bbl/complexity.py   synthesisability screen (PLACEHOLDER)
 src/bbl/config.py       lab state: base vectors, enzyme stock, availability
 src/bbl/sources.py      storage abstraction: directory / files / memory / remote
 src/bbl/llm/            LLM interface: session boundary, tools, prompts, REPL
+src/bbl/report/         bench-ready reports: maps.py figures, bench.py reagent maths,
+                        fastdigest.py supplier conditions, build.py plan -> notebook entry,
+                        html.py single-file output
 src/bbl/targets.py      target resolution + protected-feature classification (shared)
 src/bbl/enzymes.py      site enumeration, cut coordinates, end compatibility
 src/bbl/excise.py       excise_features() / plan_excisions()   -- deletion by restriction
@@ -234,6 +305,8 @@ tests/test_insert.py    pCLM3 + BoxB -> pCLM2 regression
 tests/test_inventory.py fingerprint invariants, dedup, lineage recovery
 tests/test_sourcing.py  both ladders, provenance, complexity placeholder
 tests/test_llm.py       tool contract, gates, protocol appending (offline)
+tests/test_bench.py     reagent maths against the lab's own notebook spreadsheet
+tests/test_report.py    figure pruning, route coverage, nothing-invented invariants
 tests/test_sources.py   storage independence, incl. a synthetic Benchling store
 docs/DECISIONS.md       design rationale and course corrections
 ```

@@ -28,12 +28,18 @@ MAX_HITS = 12
 
 @dataclass
 class Product:
-    """One designed plasmid, plus the plan that produced it."""
+    """One designed plasmid, plus the plan and the records that produced it."""
 
     handle: str
     record: object
     plan: object
     origin: str
+    #: The records the plan started from. Kept because a report needs to draw the parent and
+    #: cost out the donor digest, neither of which the plan itself carries.
+    parent: object = None
+    donor: object = None
+    #: ``(target_label, identical)`` for every ``compare_product`` run against this product.
+    comparisons: list = field(default_factory=list)
 
     @property
     def protocol(self) -> str:
@@ -83,10 +89,10 @@ class DesignSession:
                 )
         raise LookupError(f"no plasmid named {name!r} in {self.source.name}")
 
-    def _register(self, record, plan, origin: str) -> str:
+    def _register(self, record, plan, origin: str, parent=None, donor=None) -> str:
         self._counter += 1
         handle = f"prod_{self._counter}"
-        self.products[handle] = Product(handle, record, plan, origin)
+        self.products[handle] = Product(handle, record, plan, origin, parent, donor)
         return handle
 
     def protocol_for(self, handle: str) -> str:
@@ -165,14 +171,17 @@ class DesignSession:
     def plan_deletion(self, plasmid: str, features: list[str], method: str = "auto") -> dict:
         """Remove features. Tries restriction first unless ``method`` says otherwise."""
         entry = self.resolve(plasmid)
+        record = entry.load()
         attempts = ["restriction", "pcr"] if method == "auto" else [method]
         reasons: dict = {}
 
         for attempt in attempts:
             try:
                 if attempt == "restriction":
-                    plan = excise_features(entry.load(), features)
-                    handle = self._register(plan.product, plan, f"deletion from {entry.label}")
+                    plan = excise_features(record, features)
+                    handle = self._register(
+                        plan.product, plan, f"deletion from {entry.label}", parent=record
+                    )
                     return {
                         "feasible": True,
                         "method": "restriction",
@@ -191,9 +200,11 @@ class DesignSession:
                         "verified": True,
                     }
                 design = design_deletion_primers(
-                    entry.load(), features, warn_if_restriction_possible=False
+                    record, features, warn_if_restriction_possible=False
                 )
-                handle = self._register(design.product, design, f"deletion from {entry.label}")
+                handle = self._register(
+                    design.product, design, f"deletion from {entry.label}", parent=record
+                )
                 return {
                     "feasible": True,
                     "method": "pcr",
@@ -230,25 +241,34 @@ class DesignSession:
     ) -> dict:
         """Insert a sequence (or a feature taken from a donor plasmid) into a backbone."""
         entry = self.resolve(backbone)
+        record = entry.load()
         site = _parse_site(at)
         insert = sequence
         features = None
+        donor_record = None
         if donor is not None:
-            insert = self.resolve(donor).load()
+            donor_record = self.resolve(donor).load()
+            insert = donor_record
             features = donor_features
         if insert is None:
             return {"feasible": False, "error": "give either sequence= or donor="}
 
         try:
             plan = plan_insertion(
-                entry.load(), insert, at=site, insert_features=features, method=method
+                record, insert, at=site, insert_features=features, method=method
             )
         except NoInsertionRoute as exc:
             return {"feasible": False, "reasons": exc.reasons or {"reason": str(exc)}}
         except (ValueError, LookupError) as exc:
             return {"feasible": False, "error": str(exc)}
 
-        handle = self._register(plan.product, plan, f"insertion into {entry.label}")
+        handle = self._register(
+            plan.product,
+            plan,
+            f"insertion into {entry.label}",
+            parent=record,
+            donor=donor_record,
+        )
         return {
             "feasible": True,
             "method": plan.strategy,
@@ -290,9 +310,13 @@ class DesignSession:
         """Check a designed product against an existing plasmid, ignoring rotation."""
         if product_id not in self.products:
             return {"error": f"unknown product {product_id!r}"}
-        expected = self.resolve(target).load()
+        entry = self.resolve(target)
+        expected = entry.load()
         product = self.products[product_id].record
         identical = circular_equal(product, expected)
+        # Remembered so a report written later can state what the design was checked against,
+        # without the model having to carry the verdict back in through an argument.
+        self.products[product_id].comparisons.append((entry.label, identical))
         return {
             "product_id": product_id,
             "target": target,
@@ -321,6 +345,105 @@ class DesignSession:
             "length_bp": len(product.record),
             "features": len(product.record.features),
         }
+
+    def dna_needing_concentration(self, product_id: str) -> list[dict]:
+        """Which stocks the report's volumes depend on, so the user can be asked for them.
+
+        Every reaction volume is a mass divided by a concentration, and the concentration
+        comes off a Nanodrop after the design exists. Asking for two numbers up front turns
+        the tables from a form into a protocol.
+        """
+        if product_id not in self.products:
+            return []
+        product = self.products[product_id]
+        needed = []
+        for record, role in ((product.parent, "parent / backbone"), (product.donor, "donor")):
+            if record is None:
+                continue
+            label = self._label_for(record)
+            needed.append({"plasmid": label, "role": role, "length_bp": len(record)})
+        return needed
+
+    def _label_for(self, record) -> str:
+        """The full inventory label for a record, falling back to its short name."""
+        for entry in self.entries:
+            if entry.length == len(record) and entry.label.startswith(str(record.name)):
+                return entry.label
+        return str(getattr(record, "name", "unknown"))
+
+    def generate_report(
+        self,
+        product_id: str,
+        path: str,
+        aim: str | None = None,
+        name: str | None = None,
+        concentrations: dict | None = None,
+    ) -> dict:
+        """Write a bench-ready cloning report. Outward-facing -- goes through ``confirm``.
+
+        Everything in the report comes from the stored plan and the records it was built from.
+        ``aim`` is the user's sentence about why the construct exists; ``concentrations`` maps
+        a plasmid name to ng/uL and fills in the reaction volumes. Anything not supplied stays
+        an input box in the report rather than a guess.
+        """
+        from ..report import build_report, figures_available
+
+        if product_id not in self.products:
+            return {"error": f"unknown product {product_id!r}"}
+        product = self.products[product_id]
+        if self.confirm is not None and not self.confirm(f"write a cloning report to {path}"):
+            return {
+                "declined": True,
+                "note": "the user declined; do not retry, ask what they want instead",
+            }
+
+        written = Path(path)
+        parent_name = self._label_for(product.parent) if product.parent is not None else None
+        donor_name = self._label_for(product.donor) if product.donor is not None else None
+        report = build_report(
+            product.plan,
+            parent=product.parent,
+            product=product.record,
+            donor=product.donor,
+            aim=aim,
+            name=name,
+            parent_name=parent_name,
+            donor_name=donor_name,
+            concentrations=_numeric(concentrations),
+            config=self.config,
+            verified_against=product.comparisons[-1] if product.comparisons else None,
+        )
+        written.write_text(report.to_html())
+        return {
+            "product_id": product_id,
+            "path": str(written),
+            "sections": len(report.steps),
+            "figures": len(report.figures),
+            "maps_included": figures_available(),
+            "concentrations_supplied": sorted(_numeric(concentrations)),
+            "concentrations_missing": [
+                item["plasmid"]
+                for item in self.dna_needing_concentration(product_id)
+                if item["plasmid"] not in _numeric(concentrations)
+            ],
+        }
+
+
+def _numeric(concentrations) -> dict:
+    """Keep the entries that are actually numbers. A model may pass "unknown" or "".
+
+    Dropping a junk value is right: it becomes an input box in the report, which is honest,
+    where coercing it to zero would silently divide by nothing.
+    """
+    clean = {}
+    for key, value in (concentrations or {}).items():
+        try:
+            number = float(value)
+        except (TypeError, ValueError):
+            continue
+        if number > 0:
+            clean[str(key)] = number
+    return clean
 
 
 def _parse_site(at: str):

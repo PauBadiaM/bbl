@@ -18,7 +18,7 @@ MODEL = "claude-opus-5"
 MAX_TOKENS = 16000
 
 #: Tools that change something outside the process. Gated before execution.
-OUTWARD_FACING = {"export_product"}
+OUTWARD_FACING = {"export_product", "generate_report"}
 
 
 def build_tools(session: DesignSession) -> list:
@@ -160,6 +160,62 @@ def build_tools(session: DesignSession) -> list:
         """
         return dump(session.export_product(product_id, path))
 
+    @beta_tool
+    def report_inputs(product_id: str) -> str:
+        """List the DNA stocks whose concentration the report's reaction volumes need.
+
+        Call this **before** generate_report. Every volume in the digest and ligation tables
+        is a mass divided by a ng/µL reading, so ask the user for the ones listed here and
+        pass them to generate_report. If they do not know them yet, say so and generate the
+        report anyway — the tables become input boxes they can fill in at the bench.
+
+        Args:
+            product_id: A handle returned by a plan tool, e.g. "prod_1".
+        """
+        return dump(session.dna_needing_concentration(product_id))
+
+    @beta_tool
+    def generate_report(
+        product_id: str,
+        path: str,
+        aim: str = "",
+        name: str = "",
+        concentrations: dict | None = None,
+    ) -> str:
+        """Write a bench-ready cloning report for a designed product: procedure, reagent
+        tables and plasmid maps, as one self-contained HTML file.
+
+        Call this when the user is going to actually build the construct, or asks for a
+        protocol, a write-up, a notebook entry or something to send to a colleague. It writes
+        to disk, so only call it once a route has been chosen. Everything in it is generated
+        from the verified plan — you do not need to, and should not, draft the procedure
+        yourself.
+
+        Check report_inputs first and ask the user for the stock concentrations; passing them
+        turns the reaction tables from a form into a protocol. Anything you leave out stays an
+        input box in the report, which is fine — never invent a concentration.
+
+        Args:
+            product_id: A handle returned by a plan tool, e.g. "prod_1".
+            path: Where to write, e.g. "pCLM1_report.html".
+            aim: One sentence on why this construct is being made, in the user's own terms.
+                Leave empty if they have not said. Do not restate the cloning strategy here.
+            name: What to call the construct in the report, e.g. "pCLM1_designed". Leave empty
+                to use the name the plan gave it.
+            concentrations: Measured stocks in ng/µL, keyed by the plasmid names that
+                report_inputs returned, e.g. {"pHL391_pcDNA3.1_NFKBRE1-...": 1364}. Omit any
+                the user has not measured.
+        """
+        return dump(
+            session.generate_report(
+                product_id,
+                path,
+                aim=aim or None,
+                name=name or None,
+                concentrations=concentrations,
+            )
+        )
+
     return [
         search_inventory,
         inspect_plasmid,
@@ -168,6 +224,8 @@ def build_tools(session: DesignSession) -> list:
         source_sequence,
         compare_product,
         export_product,
+        report_inputs,
+        generate_report,
     ]
 
 

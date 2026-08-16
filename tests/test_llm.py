@@ -173,6 +173,94 @@ def test_export_rejects_an_unknown_handle(session):
 
 
 # --------------------------------------------------------------------------- #
+# reports
+# --------------------------------------------------------------------------- #
+
+
+def test_report_is_written_from_the_stored_plan(session, tmp_path):
+    handle = session.plan_deletion(PHL391, ["NFKBRE"])["product_id"]
+    out = session.generate_report(handle, str(tmp_path / "report.html"))
+    assert out["sections"] >= 4
+    html = (tmp_path / "report.html").read_text()
+    assert session.protocol_for(handle) in html.replace("&#x27;", "'")
+
+
+def test_a_report_cites_a_comparison_made_earlier(session, tmp_path):
+    """The verdict is remembered by the session, so the model cannot misreport it later."""
+    handle = session.plan_deletion(PHL391, ["NFKBRE"])["product_id"]
+    session.compare_product(handle, PCLM1)
+    session.generate_report(handle, str(tmp_path / "r.html"))
+    assert "identical to pCLM1" in (tmp_path / "r.html").read_text()
+
+
+def test_a_report_draws_the_parent_it_was_designed_from(session, tmp_path):
+    """Only worth asserting because the plan itself does not carry the parent record."""
+    handle = session.plan_deletion(PHL391, ["NFKBRE"])["product_id"]
+    session.generate_report(handle, str(tmp_path / "r.html"))
+    html = (tmp_path / "r.html").read_text()
+    assert "pHL391_pcDNA3.1_NFKBRE1-miniCMV-mCherry-LambdaBoxBx8 — 5,770 bp" in html
+    assert html.count("<svg") in (0, 4)  # both maps and both zooms, or none at all
+
+
+def test_a_report_names_plasmids_in_full(session, tmp_path):
+    """pCLM21 and pCLM24 differ only after the underscore; the short name is an accession."""
+    handle = session.plan_deletion(PHL391, ["NFKBRE"])["product_id"]
+    session.generate_report(handle, str(tmp_path / "r.html"))
+    html = (tmp_path / "r.html").read_text()
+    assert "NFKBRE1-miniCMV-mCherry-LambdaBoxBx8" in html
+
+
+def test_the_session_says_which_concentrations_it_needs(session):
+    """The prompt to ask the user is built from the design, not guessed at by the model."""
+    handle = session.plan_insertion(
+        "pCLM3", at=BOXB_SITE, donor=PCLM1, donor_features=["Lambda BoxB x8"]
+    )["product_id"]
+    needed = session.dna_needing_concentration(handle)
+    assert [item["role"] for item in needed] == ["parent / backbone", "donor"]
+    assert all(item["length_bp"] > 0 for item in needed)
+
+
+def test_supplied_concentrations_fill_the_volumes(session, tmp_path):
+    handle = session.plan_deletion(PHL391, ["NFKBRE"])["product_id"]
+    label = session.dna_needing_concentration(handle)[0]["plasmid"]
+    out = session.generate_report(
+        handle, str(tmp_path / "r.html"), concentrations={label: 100}
+    )
+    assert out["concentrations_supplied"] == [label]
+    assert out["concentrations_missing"] == []
+    # 1 ug at 100 ng/uL is 10 uL of DNA, leaving 6 uL of water in a 20 uL digest
+    assert ">10.00<" in (tmp_path / "r.html").read_text()
+
+
+def test_a_junk_concentration_is_dropped_rather_than_coerced(session, tmp_path):
+    handle = session.plan_deletion(PHL391, ["NFKBRE"])["product_id"]
+    label = session.dna_needing_concentration(handle)[0]["plasmid"]
+    out = session.generate_report(
+        handle, str(tmp_path / "r.html"), concentrations={label: "unknown"}
+    )
+    assert out["concentrations_supplied"] == []
+    assert out["concentrations_missing"] == [label]
+
+
+def test_report_writing_is_gated_like_any_other_write(plasmid_dir, tmp_path):
+    declining = DesignSession(plasmid_dir, confirm=lambda prompt: False)
+    handle = declining.plan_deletion(PHL391, ["NFKBRE"])["product_id"]
+    target = tmp_path / "nope.html"
+    assert declining.generate_report(handle, str(target))["declined"] is True
+    assert not target.exists()
+
+
+def test_report_rejects_an_unknown_handle(session):
+    assert "error" in session.generate_report("prod_999", "/tmp/x.html")
+
+
+def test_report_generation_is_declared_outward_facing():
+    from bbl.llm.tools import OUTWARD_FACING
+
+    assert "generate_report" in OUTWARD_FACING
+
+
+# --------------------------------------------------------------------------- #
 # prompt assembly
 # --------------------------------------------------------------------------- #
 
@@ -233,7 +321,8 @@ def test_tools_build_with_usable_schemas(session):
     tools = {t.name: t for t in build_tools(session)}
     assert set(tools) == {
         "search_inventory", "inspect_plasmid", "plan_deletion", "plan_insertion",
-        "source_sequence", "compare_product", "export_product",
+        "source_sequence", "compare_product", "export_product", "report_inputs",
+        "generate_report",
     }
     assert OUTWARD_FACING <= set(tools)
     for name, tool in tools.items():

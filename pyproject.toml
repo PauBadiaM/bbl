@@ -17,6 +17,11 @@ dependencies = [
 
 [project.optional-dependencies]
 test = ["pytest>=7"]
+# Plasmid maps in cloning reports. Optional so that `import bbl` never needs a plotting
+# stack; bbl.report says what to install when they are missing. On this cluster install with
+# `--only-binary=:all:` -- glibc is 2.17, so pip must not fall back to building Pillow and
+# matplotlib from source against manylinux_2_28 sdists. See docs/DECISIONS.md D77.
+report = ["dna_features_viewer>=3.1", "matplotlib>=3.7"]
 
 [tool.setuptools.packages.find]
 where = ["src"]

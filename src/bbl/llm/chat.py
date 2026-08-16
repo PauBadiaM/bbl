@@ -29,6 +29,7 @@ bbl design session -- {n} plasmids from {dir}
   Describe the construct you want, or ask about what's in the library.
   Commands:  /products    list designed products
              /protocol N  show the protocol for prod_N
+             /report N    write a bench-ready HTML report for prod_N
              /library P   switch to a different plasmid library
              /reset       clear the conversation (products are kept)
              /quit
@@ -45,6 +46,28 @@ def _fmt_args(args: dict) -> str:
         text = str(value)
         parts.append(f"{key}={text[:48] + '…' if len(text) > 48 else text}")
     return ", ".join(parts)
+
+
+def _ask_concentrations(session, handle) -> dict:
+    """Ask for the Nanodrop readings the reaction volumes need. Blank means 'not yet'.
+
+    Worth interrupting for: two numbers turn every volume in the report from a blank into a
+    figure. Skipping is free -- the tables stay live in the browser either way.
+    """
+    needed = session.dna_needing_concentration(handle)
+    if not needed:
+        return {}
+    print(f"{DIM}  stock concentrations for the reaction volumes (Enter to skip){RESET}")
+    supplied = {}
+    for item in needed:
+        try:
+            answer = input(f"  {item['plasmid']} ({item['role']}) ng/µL: ").strip()
+        except (EOFError, KeyboardInterrupt):
+            print()
+            return supplied
+        if answer:
+            supplied[item["plasmid"]] = answer
+    return supplied
 
 
 def _ask(prompt: str) -> bool:
@@ -146,13 +169,28 @@ def run(library=None, effort: str = "high", profile: str | None = None) -> int:
                     print(f"{DIM}  none yet{RESET}")
                 for handle, product in session.products.items():
                     print(f"  {handle}  {len(product.record)} bp  ({product.origin})")
-            elif command == "protocol":
+            elif command in ("protocol", "report"):
+                argument, _, destination = argument.strip().partition(" ")
                 handle = argument.strip() or (list(session.products) or [""])[-1]
                 handle = handle if handle.startswith("prod_") else f"prod_{handle}"
-                if handle in session.products:
+                if handle not in session.products:
+                    print(f"{DIM}  no such product: {handle}{RESET}")
+                elif command == "protocol":
                     print(session.protocol_for(handle))
                 else:
-                    print(f"{DIM}  no such product: {handle}{RESET}")
+                    path = destination.strip() or f"{handle}_report.html"
+                    result = session.generate_report(
+                        handle, path, concentrations=_ask_concentrations(session, handle)
+                    )
+                    if result.get("declined"):
+                        print(f"{DIM}  not written{RESET}")
+                    else:
+                        print(
+                            f"{DIM}  wrote {result['path']} — {result['sections']} steps, "
+                            f"{result['figures']} figures{RESET}"
+                        )
+                        if not result["maps_included"]:
+                            print(f'{DIM}  (no plasmid maps: pip install "bbl[report]"){RESET}')
             elif command == "library":
                 if not argument.strip():
                     print(f"  {session.source.name}  ({len(session.entries)} plasmids)")

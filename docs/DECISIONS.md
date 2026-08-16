@@ -612,3 +612,159 @@ failing means something else is wrong, and retrying would hide it.
 inherited, adding `--no-browser` when there is no display -- the usual case over SSH on a
 cluster, where it prints a URL to open elsewhere and takes the code back in the terminal. If
 the CLI is missing, the error says how to install it.
+
+
+---
+
+# D77. Reports are a form to work from, not a summary to file
+
+The report layer (`src/bbl/report/`) exists because a plan and a bench protocol are not the
+same document. `plan.protocol` says "ligate the vector and the insert"; the person at the
+bench needs to know how many microlitres of each, what percentage gel resolves the band, and
+what to write down afterwards. The shape is taken from a real lab-notebook export in the
+inventory folder (`eCLM24_Cloning_PiggyBac`, June 2026): aims, cloning strategy, then one
+section per step with its reagent table, then blanks for the results.
+
+**No design decision is taken in the report layer.** Every enzyme, coordinate and base-pair
+count is copied from the plan, and the plan's own `protocol` is reproduced verbatim in a
+"Verified plan" box above the expanded procedure. If the two ever disagree, the box is the one
+that was checked against the sequence, and the document says so. This is the same split as
+D-the-harness-renders-the-protocol in the LLM layer: the part that was verified is quoted, not
+regenerated.
+
+**Never invent a concentration. ↺** The first version filled the volume columns using a
+nominal 100 ng/µL so the tables would look complete. That is a fabricated measurement sitting
+in a column of real ones, and at the bench it is indistinguishable from a Nanodrop reading
+somebody actually took. Unknown stocks now print `____` and the *requirement* — "100 ng",
+"15 fmol" — is still stated, so the row is a form to fill in. `concentrations={}` supplies
+real numbers when they exist and the volumes compute.
+
+**The calculators are checked against the lab's own spreadsheet.** `tests/test_bench.py`
+reproduces the eCLM24 entry's Gibson volumes (2.29 / 0.71 / 1.99 µL into 10 µL) and its
+ligation backbone volume (1.797 µL) to the microlitre. Two findings came out of that:
+
+- the Gibson sheet uses 650 g/mol per bp and the ligation sheet 660. The 1.5% difference is
+  below pipetting error, but each calculator keeps the constant its source used, so the
+  numbers reconcile against the sheet they came from rather than *almost* reconciling.
+- the ligation sheet says 1:5 and then uses 80 fmol against a 15 fmol backbone, which is
+  1:5.33. We take the stated ratio literally (75 fmol). The test records the discrepancy
+  rather than quietly matching it.
+
+**Two numbers change because of repeats, and both are derived, not typed.** A tandem array is
+detected structurally — a feature containing three or more identically-labelled sub-features,
+so it catches an array whose umbrella is not called "x8". When one is present the outgrowth
+drops to 30 °C and the PCR extension goes to 45 s/kb. The second of those disagrees with the
+generic 30 s/kb in `plan.protocol`, so the report says which figure it is overriding and why;
+leaving the reader to notice two different extension times on one page is how they end up
+trusting the wrong one.
+
+**What the supplier's table knows, we do not.** FastDigest incubation times and inactivation
+temperatures are buffer- and format-specific. The enzyme-conditions table names the enzymes,
+leaves the cells blank, and links the Thermo table — the same refusal as the methylation and
+star-activity warnings in `excise`.
+
+---
+
+# D78. Drawing a SnapGene record literally buries the figure
+
+`DnaFeaturesViewer` draws what it is given, and a SnapGene record is not a clean feature list:
+47 features on pHL391, of which 23 are primer bindings, one is an umbrella spanning a fifth of
+the plasmid (`Insert Sequence`, 1167 bp over the whole cassette), five are 10 bp NF-κB
+sub-sites inside the 54 bp part being deleted, and eight are identical monomers inside
+`Lambda BoxB x8`. Plotted as-is, the label stack is taller than the plasmid.
+
+`prune_features` is the editorial pass. Nesting resolves **in opposite directions depending on
+whether the children agree**:
+
+- children with **different** labels → the parent is an umbrella and the children are the
+  informative layer, so the umbrella goes (`Insert Sequence`);
+- children with **one** label → the parent is an array and it is the informative layer, so the
+  children go (`Lambda BoxB x8` keeps its name, the eight monomers disappear).
+
+**A protected span overrides all of it. ↺** The umbrella rule alone deletes `NFKBRE` — it
+contains five differently-named sub-sites, so by the rule it is an umbrella. It is also the
+feature the report is about. The target's span is passed in as `protect`, survives every pass,
+and its children then fall out as nested-inside-a-retained-feature. Inferring the target from
+the edit coordinates instead does not work: the smallest feature containing the cut-to-cut
+span is `Insert Sequence`, not `NFKBRE`.
+
+**Only features wholly inside the edit are coloured as removed.** A feature merely straddling
+the span survives the edit, truncated; colouring it red would misreport it as deleted.
+
+**Figures are inline SVG, not files.** A report is one artefact — nothing to keep together,
+nothing to lose. Matplotlib derives clip-path ids from `svg.hashsalt`, so each figure is
+rendered under its own salt; without that, four figures in one document can capture each
+other's clip paths. A test asserts the referenced ids are disjoint across figures.
+
+**The plotting stack is an optional extra**, so `import bbl` never needs matplotlib. A missing
+extra degrades to a report with no maps and a warning saying what to install — it does not
+raise. On this cluster it must be installed with `--only-binary=:all:`: glibc is 2.17, current
+Pillow and matplotlib ship `manylinux_2_28` wheels, and without the flag pip falls back to
+building them from source and fails on a missing libjpeg. Same class of problem as the
+`pydivsufsort` pin in D3.
+
+
+---
+
+# D79. Second pass on the report, from bench feedback
+
+Seven changes after the first draft was read by the person who would use it.
+
+**Fill in the supplier's table rather than linking it. ↺** D77 argued that FastDigest
+incubation and inactivation conditions were the supplier's to state and ours to leave blank.
+The feedback was blunt: look it up. That was right, and the refusal was the wrong instinct
+applied to the wrong thing — these are *published constants*, not judgement calls, and the
+cost of the blank was a person opening a browser mid-protocol. `report/fastdigest.py` is now a
+dated scrape of Thermo's own table, 176 enzymes, and every rendered table carries the
+retrieval date and the link. What survives from D77 is the boundary: an enzyme not in the
+table still renders blank rather than plausible.
+
+Doing this surfaced two facts the hand-written defaults had wrong, both on the validated
+pHL391 → pCLM1 digest:
+
+- **MfeI cannot be heat-inactivated** (Thermo sells it as MunI; "No — chloroform extraction").
+  The protocol previously said "then heat-inactivate" for every digest. It now says to
+  column-purify, and says which enzyme is the reason.
+- **EcoRI shows star activity beyond 0.5 h**, and the default incubation was "37 °C for 1 h",
+  copied from the notebook entry. A FastDigest reaction is *five minutes*; the old default
+  spent an hour past the point where EcoRI starts cutting the wrong sites. Incubation is now
+  derived per digest — the slowest enzyme sets the time, the least heat-labile sets the
+  inactivation.
+
+The name mapping is derived, not maintained: our planner says MfeI and ClaI, FastDigest sells
+MunI and Bsu15I, and Biopython's `isoschizomers()` already knows they are the same activity.
+
+**Reaction tables are live. ↺** Every volume is a mass over a ng/µL reading that does not
+exist when the report is written, so the first draft printed `____` and left arithmetic for
+the reader. Now the stock column is an input and the volumes recompute in the page — 30 lines
+of dependency-free JavaScript, because the report has to keep working from a `file://` URL
+with no network years from now. Digest, Gibson and ligation collapsed into one `Reaction`
+model to make that a single calculator rather than three. The water row goes red when the DNA
+alone overflows the reaction, which is a real 8pm mistake.
+
+The `_ = "no scripts"_` property from D77 is therefore gone, replaced by a narrower one the
+test now enforces: no `src=`, no `<link>`, no `@import` — nothing is ever *fetched*.
+
+**Ask for the concentrations rather than waiting to be given them.** `report_inputs` lists
+the stocks a given design needs and the system prompt tells the model to ask before writing
+the report. Supplied numbers fill the tables; junk ("unknown", "") is dropped rather than
+coerced, because a zero silently divides.
+
+**Full construct names.** A loaded record keeps a 16-character GenBank LOCUS name, which is an
+accession — and pCLM21 through pCLM24 differ only after the underscore. The report now takes
+the inventory label and renames a shallow *view* of the record, so the caller's copy is
+untouched. Short IDs survive only where a full name would be noise, e.g. gel lane lists.
+
+**Circular labels follow the circle.** DnaFeaturesViewer stacks them in a block above the
+plot; on pHL391 that block was taller than the plasmid and impossible to match to a feature.
+Labels are now placed by hand at each feature's own angle, reading outward, with crowded
+neighbours pushed to an outer ring — so the map uses the bottom of the circle as well as the
+top, the way SnapGene's does. Capped at 14 labels plus whatever is protected.
+
+**Verification section and warnings appendix removed.** Both were requested, and both were
+defensible: an appendix of caveats is where cautions go to be skipped. What was actionable in
+them moved into the step it applies to — junction screening into transformation, the
+repeat-array check into colony picking. `DesignReport.warnings` still exists for callers and
+tests; it is simply not rendered.
+
+**The clone table is editable and grows a row on demand.** You picked six colonies, not three.
